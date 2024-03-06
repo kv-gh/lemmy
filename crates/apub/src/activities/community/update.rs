@@ -7,64 +7,59 @@ use crate::{
     verify_person_in_community,
   },
   activity_lists::AnnouncableActivities,
-  insert_activity,
-  objects::{community::ApubCommunity, person::ApubPerson},
+  insert_received_activity,
+  objects::{community::ApubCommunity, person::ApubPerson, read_from_string_or_source_opt},
   protocol::{activities::community::update::UpdateCommunity, InCommunity},
-  SendActivity,
 };
 use activitypub_federation::{
   config::Data,
   kinds::{activity::UpdateType, public},
   traits::{ActivityHandler, Actor, Object},
 };
-use lemmy_api_common::{
-  community::{CommunityResponse, EditCommunity, HideCommunity},
-  context::LemmyContext,
-  utils::local_user_view_from_jwt,
+use lemmy_api_common::context::LemmyContext;
+use lemmy_db_schema::{
+  source::{
+    activity::ActivitySendTargets,
+    community::{Community, CommunityUpdateForm},
+    person::Person,
+  },
+  traits::Crud,
+  utils::naive_now,
 };
-use lemmy_db_schema::{source::community::Community, traits::Crud};
 use lemmy_utils::error::LemmyError;
 use url::Url;
 
-#[async_trait::async_trait]
-impl SendActivity for EditCommunity {
-  type Response = CommunityResponse;
+pub(crate) async fn send_update_community(
+  community: Community,
+  actor: Person,
+  context: Data<LemmyContext>,
+) -> Result<(), LemmyError> {
+  let community: ApubCommunity = community.into();
+  let actor: ApubPerson = actor.into();
+  let id = generate_activity_id(
+    UpdateType::Update,
+    &context.settings().get_protocol_and_hostname(),
+  )?;
+  let update = UpdateCommunity {
+    actor: actor.id().into(),
+    to: vec![public()],
+    object: Box::new(community.clone().into_json(&context).await?),
+    cc: vec![community.id()],
+    kind: UpdateType::Update,
+    id: id.clone(),
+    audience: Some(community.id().into()),
+  };
 
-  async fn send_activity(
-    request: &Self,
-    _response: &Self::Response,
-    context: &Data<LemmyContext>,
-  ) -> Result<(), LemmyError> {
-    let local_user_view = local_user_view_from_jwt(&request.auth, context).await?;
-    let community = Community::read(context.pool(), request.community_id).await?;
-    UpdateCommunity::send(community.into(), &local_user_view.person.into(), context).await
-  }
-}
-
-impl UpdateCommunity {
-  #[tracing::instrument(skip_all)]
-  pub async fn send(
-    community: ApubCommunity,
-    actor: &ApubPerson,
-    context: &Data<LemmyContext>,
-  ) -> Result<(), LemmyError> {
-    let id = generate_activity_id(
-      UpdateType::Update,
-      &context.settings().get_protocol_and_hostname(),
-    )?;
-    let update = UpdateCommunity {
-      actor: actor.id().into(),
-      to: vec![public()],
-      object: Box::new(community.clone().into_json(context).await?),
-      cc: vec![community.id()],
-      kind: UpdateType::Update,
-      id: id.clone(),
-      audience: Some(community.id().into()),
-    };
-
-    let activity = AnnouncableActivities::UpdateCommunity(update);
-    send_activity_in_community(activity, actor, &community, vec![], true, context).await
-  }
+  let activity = AnnouncableActivities::UpdateCommunity(update);
+  send_activity_in_community(
+    activity,
+    &actor,
+    &community,
+    ActivitySendTargets::empty(),
+    true,
+    &context,
+  )
+  .await
 }
 
 #[async_trait::async_trait]
@@ -85,34 +80,41 @@ impl ActivityHandler for UpdateCommunity {
     verify_is_public(&self.to, &self.cc)?;
     let community = self.community(context).await?;
     verify_person_in_community(&self.actor, &community, context).await?;
-    verify_mod_action(&self.actor, self.object.id.inner(), community.id, context).await?;
+    verify_mod_action(&self.actor, &community, context).await?;
     ApubCommunity::verify(&self.object, &community.actor_id.clone().into(), context).await?;
     Ok(())
   }
 
   #[tracing::instrument(skip_all)]
   async fn receive(self, context: &Data<Self::DataType>) -> Result<(), LemmyError> {
-    insert_activity(&self.id, &self, false, false, context).await?;
+    insert_received_activity(&self.id, context).await?;
     let community = self.community(context).await?;
 
-    let community_update_form = self.object.into_update_form();
+    let community_update_form = CommunityUpdateForm {
+      title: Some(self.object.name.unwrap_or(self.object.preferred_username)),
+      description: Some(read_from_string_or_source_opt(
+        &self.object.summary,
+        &None,
+        &self.object.source,
+      )),
+      published: self.object.published.map(Into::into),
+      updated: Some(self.object.updated.map(Into::into)),
+      nsfw: Some(self.object.sensitive.unwrap_or(false)),
+      actor_id: Some(self.object.id.into()),
+      public_key: Some(self.object.public_key.public_key_pem),
+      last_refreshed_at: Some(naive_now()),
+      icon: Some(self.object.icon.map(|i| i.url.into())),
+      banner: Some(self.object.image.map(|i| i.url.into())),
+      followers_url: Some(self.object.followers.into()),
+      inbox_url: Some(self.object.inbox.into()),
+      shared_inbox_url: Some(self.object.endpoints.map(|e| e.shared_inbox.into())),
+      moderators_url: self.object.attributed_to.map(Into::into),
+      posting_restricted_to_mods: self.object.posting_restricted_to_mods,
+      featured_url: self.object.featured.map(Into::into),
+      ..Default::default()
+    };
 
-    Community::update(context.pool(), community.id, &community_update_form).await?;
+    Community::update(&mut context.pool(), community.id, &community_update_form).await?;
     Ok(())
-  }
-}
-
-#[async_trait::async_trait]
-impl SendActivity for HideCommunity {
-  type Response = CommunityResponse;
-
-  async fn send_activity(
-    request: &Self,
-    _response: &Self::Response,
-    context: &Data<LemmyContext>,
-  ) -> Result<(), LemmyError> {
-    let local_user_view = local_user_view_from_jwt(&request.auth, context).await?;
-    let community = Community::read(context.pool(), request.community_id).await?;
-    UpdateCommunity::send(community.into(), &local_user_view.person.into(), context).await
   }
 }

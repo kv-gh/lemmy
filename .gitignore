@@ -20,6 +20,7 @@ query_testing/**/reports/*.json
 api_tests/node_modules
 api_tests/.yalc
 api_tests/yalc.lock
+api_tests/pict-rs
 
 # pictrs data
 pictrs/
@@ -30,3 +31,6 @@ bindings
 # Database cluster and sockets for testing
 dev_pgdata/
 *.PGSQL.*
+
+# database dumps
+*.sqldump

@@ -35,7 +35,11 @@ pub fn scrape_text_for_mentions(text: &str) -> Vec<MentionData> {
 
 #[cfg(test)]
 mod test {
+  #![allow(clippy::unwrap_used)]
+  #![allow(clippy::indexing_slicing)]
+
   use crate::utils::mention::scrape_text_for_mentions;
+  use pretty_assertions::assert_eq;
 
   #[test]
   fn test_mentions_regex() {

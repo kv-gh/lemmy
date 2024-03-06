@@ -16,7 +16,7 @@ pub mod activities;
 pub(crate) mod collections;
 pub(crate) mod objects;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Source {
   pub(crate) content: String,
@@ -32,7 +32,7 @@ impl Source {
   }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageObject {
   #[serde(rename = "type")]
@@ -74,7 +74,7 @@ impl<Kind: Id + DeserializeOwned + Send> IdOrNestedObject<Kind> {
   pub(crate) async fn object(self, context: &Data<LemmyContext>) -> Result<Kind, LemmyError> {
     match self {
       // TODO: move IdOrNestedObject struct to library and make fetch_object_http private
-      IdOrNestedObject::Id(i) => Ok(fetch_object_http(&i, context).await?),
+      IdOrNestedObject::Id(i) => Ok(fetch_object_http(&i, context).await?.object),
       IdOrNestedObject::NestedObject(o) => Ok(o),
     }
   }

@@ -1,6 +1,10 @@
 use doku::Document;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr};
+use smart_default::SmartDefault;
+use std::{
+  env,
+  net::{IpAddr, Ipv4Addr},
+};
 use url::Url;
 
 #[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
@@ -9,7 +13,6 @@ pub struct Settings {
   /// settings related to the postgresql database
   #[default(Default::default())]
   pub database: DatabaseConfig,
-  /// Settings related to activitypub federation
   /// Pictrs image server configuration.
   #[default(Some(Default::default()))]
   pub(crate) pictrs: Option<PictrsConfig>,
@@ -49,6 +52,19 @@ pub struct Settings {
   #[default(None)]
   #[doku(example = "Some(Default::default())")]
   pub prometheus: Option<PrometheusConfig>,
+  /// Sets a response Access-Control-Allow-Origin CORS header
+  /// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+  #[default(None)]
+  #[doku(example = "*")]
+  cors_origin: Option<String>,
+}
+
+impl Settings {
+  pub fn cors_origin(&self) -> Option<String> {
+    env::var("LEMMY_CORS_ORIGIN")
+      .ok()
+      .or(self.cors_origin.clone())
+  }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
@@ -62,16 +78,52 @@ pub struct PictrsConfig {
   /// Set a custom pictrs API key. ( Required for deleting images )
   #[default(None)]
   pub api_key: Option<String>,
+
+  /// Backwards compatibility with 0.18.1. False is equivalent to `image_mode: None`, true is
+  /// equivalent to `image_mode: StoreLinkPreviews`.
+  ///
+  /// To be removed in 0.20
+  pub(super) cache_external_link_previews: Option<bool>,
+
+  /// Specifies how to handle remote images, so that users don't have to connect directly to remote servers.
+  #[default(PictrsImageMode::StoreLinkPreviews)]
+  pub(super) image_mode: PictrsImageMode,
+
+  /// Timeout for uploading images to pictrs (in seconds)
+  #[default(30)]
+  pub upload_timeout: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub enum PictrsImageMode {
+  /// Leave images unchanged, don't generate any local thumbnails for post urls. Instead the the
+  /// Opengraph image is directly returned as thumbnail
+  None,
+  /// Generate thumbnails for external post urls and store them persistently in pict-rs. This
+  /// ensures that they can be reliably retrieved and can be resized using pict-rs APIs. However
+  /// it also increases storage usage.
+  ///
+  /// This is the default behaviour, and also matches Lemmy 0.18.
+  #[default]
+  StoreLinkPreviews,
+  /// If enabled, all images from remote domains are rewritten to pass through `/api/v3/image_proxy`,
+  /// including embedded images in markdown. Images are stored temporarily in pict-rs for caching.
+  /// This improves privacy as users don't expose their IP to untrusted servers, and decreases load
+  /// on other servers. However it increases bandwidth use for the local server.
+  ///
+  /// Requires pict-rs 0.5
+  ProxyAllImages,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
 #[serde(default)]
 pub struct DatabaseConfig {
   #[serde(flatten, default)]
-  pub connection: DatabaseConnection,
+  pub(crate) connection: DatabaseConnection,
 
   /// Maximum number of active sql connections
-  #[default(5)]
+  #[default(30)]
   pub pool_size: usize,
 }
 
@@ -113,10 +165,10 @@ pub struct DatabaseConnectionParts {
   pub(super) user: String,
   /// Password to connect to postgres
   #[default("password")]
-  pub password: String,
+  pub(super) password: String,
   #[default("localhost")]
   /// Host where postgres is running
-  pub host: String,
+  pub(super) host: String,
   /// Port where postgres can be accessed
   #[default(5432)]
   pub(super) port: i32,
@@ -134,7 +186,7 @@ pub struct EmailConfig {
   /// Login name for smtp server
   pub smtp_login: Option<String>,
   /// Password to login to the smtp server
-  pub smtp_password: Option<String>,
+  smtp_password: Option<String>,
   #[doku(example = "noreply@example.com")]
   /// Address to send emails from, eg "noreply@your-instance.com"
   pub smtp_from_address: String,
@@ -144,16 +196,24 @@ pub struct EmailConfig {
   pub tls_type: String,
 }
 
+impl EmailConfig {
+  pub fn smtp_password(&self) -> Option<String> {
+    std::env::var("LEMMY_SMTP_PASSWORD")
+      .ok()
+      .or(self.smtp_password.clone())
+  }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
 #[serde(deny_unknown_fields)]
 pub struct SetupConfig {
   /// Username for the admin user
   #[doku(example = "admin")]
   pub admin_username: String,
-  /// Password for the admin user. It must be at least 10 characters.
+  /// Password for the admin user. It must be between 10 and 60 characters.
   #[doku(example = "tf6HHDS4RolWfFhk4Rq9")]
   pub admin_password: String,
-  /// Name of the site (can be changed later)
+  /// Name of the site, can be changed later. Maximum 20 characters.
   #[doku(example = "My Lemmy Instance")]
   pub site_name: String,
   /// Email for the admin user (optional, can be omitted and set later through the website)
@@ -166,11 +226,11 @@ pub struct SetupConfig {
 #[serde(deny_unknown_fields)]
 pub struct PrometheusConfig {
   // Address that the Prometheus metrics will be served on.
-  #[default(Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))]
+  #[default(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))]
   #[doku(example = "127.0.0.1")]
-  pub bind: Option<IpAddr>,
+  pub bind: IpAddr,
   // Port that the Prometheus metrics will be served on.
-  #[default(Some(10002))]
+  #[default(10002)]
   #[doku(example = "10002")]
-  pub port: Option<i32>,
+  pub port: i32,
 }

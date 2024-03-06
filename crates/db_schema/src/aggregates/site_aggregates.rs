@@ -7,7 +7,7 @@ use diesel::result::Error;
 use diesel_async::RunQueryDsl;
 
 impl SiteAggregates {
-  pub async fn read(pool: &DbPool) -> Result<Self, Error> {
+  pub async fn read(pool: &mut DbPool<'_>) -> Result<Self, Error> {
     let conn = &mut get_conn(pool).await?;
     site_aggregates::table.first::<Self>(conn).await
   }
@@ -15,6 +15,9 @@ impl SiteAggregates {
 
 #[cfg(test)]
 mod tests {
+  #![allow(clippy::unwrap_used)]
+  #![allow(clippy::indexing_slicing)]
+
   use crate::{
     aggregates::site_aggregates::SiteAggregates,
     source::{
@@ -28,9 +31,12 @@ mod tests {
     traits::Crud,
     utils::{build_db_pool_for_tests, DbPool},
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
-  async fn prepare_site_with_community(pool: &DbPool) -> (Instance, Person, Site, Community) {
+  async fn prepare_site_with_community(
+    pool: &mut DbPool<'_>,
+  ) -> (Instance, Person, Site, Community) {
     let inserted_instance = Instance::read_or_create(pool, "my_domain.tld".to_string())
       .await
       .unwrap();
@@ -70,6 +76,7 @@ mod tests {
   #[serial]
   async fn test_crud() {
     let pool = &build_db_pool_for_tests().await;
+    let pool = &mut pool.into();
 
     let (inserted_instance, inserted_person, inserted_site, inserted_community) =
       prepare_site_with_community(pool).await;
@@ -143,6 +150,7 @@ mod tests {
   #[serial]
   async fn test_soft_delete() {
     let pool = &build_db_pool_for_tests().await;
+    let pool = &mut pool.into();
 
     let (inserted_instance, inserted_person, inserted_site, inserted_community) =
       prepare_site_with_community(pool).await;
@@ -153,7 +161,10 @@ mod tests {
     Community::update(
       pool,
       inserted_community.id,
-      &CommunityUpdateForm::builder().deleted(Some(true)).build(),
+      &CommunityUpdateForm {
+        deleted: Some(true),
+        ..Default::default()
+      },
     )
     .await
     .unwrap();
@@ -164,7 +175,10 @@ mod tests {
     Community::update(
       pool,
       inserted_community.id,
-      &CommunityUpdateForm::builder().deleted(Some(false)).build(),
+      &CommunityUpdateForm {
+        deleted: Some(false),
+        ..Default::default()
+      },
     )
     .await
     .unwrap();
@@ -172,7 +186,10 @@ mod tests {
     Community::update(
       pool,
       inserted_community.id,
-      &CommunityUpdateForm::builder().removed(Some(true)).build(),
+      &CommunityUpdateForm {
+        removed: Some(true),
+        ..Default::default()
+      },
     )
     .await
     .unwrap();
@@ -183,7 +200,10 @@ mod tests {
     Community::update(
       pool,
       inserted_community.id,
-      &CommunityUpdateForm::builder().deleted(Some(true)).build(),
+      &CommunityUpdateForm {
+        deleted: Some(true),
+        ..Default::default()
+      },
     )
     .await
     .unwrap();

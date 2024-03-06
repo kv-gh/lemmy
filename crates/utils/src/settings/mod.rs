@@ -1,18 +1,14 @@
-use crate::{
-  error::LemmyError,
-  location_info,
-  settings::structs::{PictrsConfig, Settings},
-};
+use crate::{error::LemmyError, location_info};
 use anyhow::{anyhow, Context};
 use deser_hjson::from_str;
 use once_cell::sync::Lazy;
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use regex::Regex;
 use std::{env, fs, io::Error};
+use urlencoding::encode;
 
 pub mod structs;
 
-use structs::DatabaseConnection;
+use structs::{DatabaseConnection, PictrsConfig, PictrsImageMode, Settings};
 
 static DEFAULT_CONFIG_FILE: &str = "config/config.hjson";
 
@@ -38,23 +34,26 @@ impl Settings {
     let config = from_str::<Settings>(&Self::read_config_file()?)?;
 
     if config.hostname == "unset" {
-      return Err(anyhow!("Hostname variable is not set!").into());
+      Err(anyhow!("Hostname variable is not set!").into())
+    } else {
+      Ok(config)
     }
-
-    Ok(config)
   }
 
   pub fn get_database_url(&self) -> String {
+    if let Ok(url) = env::var("LEMMY_DATABASE_URL") {
+      return url;
+    }
     match &self.database.connection {
       DatabaseConnection::Uri { uri } => uri.clone(),
       DatabaseConnection::Parts(parts) => {
         format!(
           "postgres://{}:{}@{}:{}/{}",
-          utf8_percent_encode(&parts.user, NON_ALPHANUMERIC),
-          utf8_percent_encode(&parts.password, NON_ALPHANUMERIC),
+          encode(&parts.user),
+          encode(&parts.password),
           parts.host,
           parts.port,
-          utf8_percent_encode(&parts.database, NON_ALPHANUMERIC),
+          encode(&parts.database),
         )
       }
     }
@@ -107,5 +106,19 @@ impl Settings {
       .pictrs
       .clone()
       .ok_or_else(|| anyhow!("images_disabled").into())
+  }
+}
+
+impl PictrsConfig {
+  pub fn image_mode(&self) -> PictrsImageMode {
+    if let Some(cache_external_link_previews) = self.cache_external_link_previews {
+      if cache_external_link_previews {
+        PictrsImageMode::StoreLinkPreviews
+      } else {
+        PictrsImageMode::None
+      }
+    } else {
+      self.image_mode.clone()
+    }
   }
 }

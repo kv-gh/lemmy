@@ -1,9 +1,16 @@
-use crate::sensitive::Sensitive;
+use crate::federate_retry_sleep_duration;
+use chrono::{DateTime, Utc};
 use lemmy_db_schema::{
-  newtypes::{CommentId, CommunityId, LanguageId, PersonId, PostId},
-  source::{instance::Instance, language::Language, tagline::Tagline},
+  newtypes::{CommentId, CommunityId, InstanceId, LanguageId, PersonId, PostId},
+  source::{
+    federation_queue_state::FederationQueueState,
+    instance::Instance,
+    language::Language,
+    tagline::Tagline,
+  },
   ListingType,
   ModlogActionType,
+  PostListingMode,
   RegistrationMode,
   SearchType,
   SortType,
@@ -21,6 +28,7 @@ use lemmy_db_views_actor::structs::{
   CommunityFollowerView,
   CommunityModeratorView,
   CommunityView,
+  InstanceBlockView,
   PersonBlockView,
   PersonView,
 };
@@ -47,7 +55,7 @@ use serde_with::skip_serializing_none;
 use ts_rs::TS;
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Searches the site, given a query string, and some optional filters.
@@ -61,7 +69,6 @@ pub struct Search {
   pub listing_type: Option<ListingType>,
   pub page: Option<i64>,
   pub limit: Option<i64>,
-  pub auth: Option<Sensitive<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -77,14 +84,13 @@ pub struct SearchResponse {
   pub users: Vec<PersonView>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Does an apub fetch for an object.
 pub struct ResolveObject {
   /// Can be the full url, or a shortened version like: !fediverse@lemmy.ml
   pub q: String,
-  pub auth: Sensitive<String>,
 }
 
 #[skip_serializing_none]
@@ -101,7 +107,7 @@ pub struct ResolveObjectResponse {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Fetches the modlog.
@@ -112,7 +118,8 @@ pub struct GetModlog {
   pub limit: Option<i64>,
   pub type_: Option<ModlogActionType>,
   pub other_person_id: Option<PersonId>,
-  pub auth: Option<Sensitive<String>>,
+  pub post_id: Option<PostId>,
+  pub comment_id: Option<CommentId>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -139,7 +146,7 @@ pub struct GetModlogResponse {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Creates a site. Should be done after first running lemmy.
@@ -157,6 +164,7 @@ pub struct CreateSite {
   pub private_instance: Option<bool>,
   pub default_theme: Option<String>,
   pub default_post_listing_type: Option<ListingType>,
+  pub default_sort_type: Option<SortType>,
   pub legal_information: Option<String>,
   pub application_email_admins: Option<bool>,
   pub hide_modlog_mod_names: Option<bool>,
@@ -183,11 +191,12 @@ pub struct CreateSite {
   pub blocked_instances: Option<Vec<String>>,
   pub taglines: Option<Vec<String>>,
   pub registration_mode: Option<RegistrationMode>,
-  pub auth: Sensitive<String>,
+  pub content_warning: Option<String>,
+  pub default_post_listing_mode: Option<PostListingMode>,
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Edits a site.
@@ -215,6 +224,8 @@ pub struct EditSite {
   /// The default theme. Usually "browser"
   pub default_theme: Option<String>,
   pub default_post_listing_type: Option<ListingType>,
+  /// The default sort, usually "active"
+  pub default_sort_type: Option<SortType>,
   /// An optional page of legal information
   pub legal_information: Option<String>,
   /// Whether to email admins when receiving a new application.
@@ -262,16 +273,11 @@ pub struct EditSite {
   pub registration_mode: Option<RegistrationMode>,
   /// Whether to email admins for new reports.
   pub reports_email_admins: Option<bool>,
-  pub auth: Sensitive<String>,
-}
-
-#[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-#[cfg_attr(feature = "full", derive(TS))]
-#[cfg_attr(feature = "full", ts(export))]
-/// Fetches the site.
-pub struct GetSite {
-  pub auth: Option<Sensitive<String>>,
+  /// If present, nsfw content is visible by default. Should be displayed by frontends/clients
+  /// when the site is first opened by a user.
+  pub content_warning: Option<String>,
+  /// Default value for [LocalUser.post_listing_mode]
+  pub default_post_listing_mode: Option<PostListingMode>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -305,15 +311,6 @@ pub struct GetSiteResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
-/// Fetches the federated instances for your site.
-pub struct GetFederatedInstances {
-  pub auth: Option<Sensitive<String>>,
-}
-
-#[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "full", derive(TS))]
-#[cfg_attr(feature = "full", ts(export))]
 /// A response of federated instances.
 pub struct GetFederatedInstancesResponse {
   /// Optional, because federation may be disabled.
@@ -329,6 +326,7 @@ pub struct MyUserInfo {
   pub follows: Vec<CommunityFollowerView>,
   pub moderates: Vec<CommunityModeratorView>,
   pub community_blocks: Vec<CommunityBlockView>,
+  pub instance_blocks: Vec<InstanceBlockView>,
   pub person_blocks: Vec<PersonBlockView>,
   pub discussion_languages: Vec<LanguageId>,
 }
@@ -336,75 +334,89 @@ pub struct MyUserInfo {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
-/// Leaves the admin team.
-pub struct LeaveAdmin {
-  pub auth: Sensitive<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "full", derive(TS))]
-#[cfg_attr(feature = "full", ts(export))]
 /// A list of federated instances.
 pub struct FederatedInstances {
-  pub linked: Vec<Instance>,
-  pub allowed: Vec<Instance>,
-  pub blocked: Vec<Instance>,
+  pub linked: Vec<InstanceWithFederationState>,
+  pub allowed: Vec<InstanceWithFederationState>,
+  pub blocked: Vec<InstanceWithFederationState>,
 }
 
 #[skip_serializing_none]
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+pub struct ReadableFederationState {
+  #[serde(flatten)]
+  internal_state: FederationQueueState,
+  /// timestamp of the next retry attempt (null if fail count is 0)
+  next_retry: Option<DateTime<Utc>>,
+}
+
+impl From<FederationQueueState> for ReadableFederationState {
+  fn from(internal_state: FederationQueueState) -> Self {
+    ReadableFederationState {
+      next_retry: internal_state.last_retry.map(|r| {
+        r + chrono::Duration::from_std(federate_retry_sleep_duration(internal_state.fail_count))
+          .expect("sleep duration longer than 2**63 ms (262 million years)")
+      }),
+      internal_state,
+    }
+  }
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+pub struct InstanceWithFederationState {
+  #[serde(flatten)]
+  pub instance: Instance,
+  /// if federation to this instance is or was active, show state of outgoing federation to this instance
+  pub federation_state: Option<ReadableFederationState>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Purges a person from the database. This will delete all content attached to that person.
 pub struct PurgePerson {
   pub person_id: PersonId,
   pub reason: Option<String>,
-  pub auth: Sensitive<String>,
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Purges a community from the database. This will delete all content attached to that community.
 pub struct PurgeCommunity {
   pub community_id: CommunityId,
   pub reason: Option<String>,
-  pub auth: Sensitive<String>,
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Purges a post from the database. This will delete all content attached to that post.
 pub struct PurgePost {
   pub post_id: PostId,
   pub reason: Option<String>,
-  pub auth: Sensitive<String>,
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Purges a comment from the database. This will delete all content attached to that comment.
 pub struct PurgeComment {
   pub comment_id: CommentId,
   pub reason: Option<String>,
-  pub auth: Sensitive<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "full", derive(TS))]
-#[cfg_attr(feature = "full", ts(export))]
-/// The response for purged items.
-pub struct PurgeItemResponse {
-  pub success: bool,
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Fetches a list of registration applications.
@@ -413,7 +425,6 @@ pub struct ListRegistrationApplications {
   pub unread_only: Option<bool>,
   pub page: Option<i64>,
   pub limit: Option<i64>,
-  pub auth: Sensitive<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -425,7 +436,7 @@ pub struct ListRegistrationApplicationsResponse {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// Approves a registration application.
@@ -433,7 +444,6 @@ pub struct ApproveRegistrationApplication {
   pub id: i32,
   pub approve: bool,
   pub deny_reason: Option<String>,
-  pub auth: Sensitive<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -447,15 +457,24 @@ pub struct RegistrationApplicationResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
-/// Gets a count of unread registration applications.
-pub struct GetUnreadRegistrationApplicationCount {
-  pub auth: Sensitive<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "full", derive(TS))]
-#[cfg_attr(feature = "full", ts(export))]
 /// The count of unread registration applications.
 pub struct GetUnreadRegistrationApplicationCountResponse {
   pub registration_applications: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// Block an instance as user
+pub struct BlockInstance {
+  pub instance_id: InstanceId,
+  pub block: bool,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+pub struct BlockInstanceResponse {
+  pub blocked: bool,
 }

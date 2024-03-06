@@ -20,15 +20,20 @@ use activitypub_federation::{
   traits::Object,
 };
 use anyhow::anyhow;
-use chrono::NaiveDateTime;
-use html2md::parse_html;
+use chrono::{DateTime, Utc};
+use html2text::{from_read_with_decorator, render::text_renderer::TrivialDecorator};
 use lemmy_api_common::{
   context::LemmyContext,
-  request::fetch_site_data,
-  utils::{is_mod_or_admin, local_site_opt_to_sensitive, local_site_opt_to_slur_regex},
+  request::fetch_link_metadata_opt,
+  utils::{
+    is_mod_or_admin,
+    local_site_opt_to_sensitive,
+    local_site_opt_to_slur_regex,
+    process_markdown_opt,
+    proxy_image_link_opt_apub,
+  },
 };
 use lemmy_db_schema::{
-  self,
   source::{
     community::Community,
     local_site::LocalSite,
@@ -40,19 +45,15 @@ use lemmy_db_schema::{
 };
 use lemmy_utils::{
   error::LemmyError,
-  utils::{
-    markdown::markdown_to_html,
-    slurs::{check_slurs_opt, remove_slurs},
-    time::convert_datetime,
-    validation::check_url_scheme,
-  },
+  utils::{markdown::markdown_to_html, slurs::check_slurs_opt, validation::check_url_scheme},
 };
 use std::ops::Deref;
+use stringreader::StringReader;
 use url::Url;
 
 const MAX_TITLE_LENGTH: usize = 200;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ApubPost(pub(crate) Post);
 
 impl Deref for ApubPost {
@@ -74,7 +75,7 @@ impl Object for ApubPost {
   type Kind = Page;
   type Error = LemmyError;
 
-  fn last_refreshed_at(&self) -> Option<NaiveDateTime> {
+  fn last_refreshed_at(&self) -> Option<DateTime<Utc>> {
     None
   }
 
@@ -84,7 +85,7 @@ impl Object for ApubPost {
     context: &Data<Self::DataType>,
   ) -> Result<Option<Self>, LemmyError> {
     Ok(
-      Post::read_from_apub_id(context.pool(), object_id)
+      Post::read_from_apub_id(&mut context.pool(), object_id)
         .await?
         .map(Into::into),
     )
@@ -93,8 +94,11 @@ impl Object for ApubPost {
   #[tracing::instrument(skip_all)]
   async fn delete(self, context: &Data<Self::DataType>) -> Result<(), LemmyError> {
     if !self.deleted {
-      let form = PostUpdateForm::builder().deleted(Some(true)).build();
-      Post::update(context.pool(), self.id, &form).await?;
+      let form = PostUpdateForm {
+        deleted: Some(true),
+        ..Default::default()
+      };
+      Post::update(&mut context.pool(), self.id, &form).await?;
     }
     Ok(())
   }
@@ -103,10 +107,23 @@ impl Object for ApubPost {
   #[tracing::instrument(skip_all)]
   async fn into_json(self, context: &Data<Self::DataType>) -> Result<Page, LemmyError> {
     let creator_id = self.creator_id;
-    let creator = Person::read(context.pool(), creator_id).await?;
+    let creator = Person::read(&mut context.pool(), creator_id).await?;
     let community_id = self.community_id;
-    let community = Community::read(context.pool(), community_id).await?;
-    let language = LanguageTag::new_single(self.language_id, context.pool()).await?;
+    let community = Community::read(&mut context.pool(), community_id).await?;
+    let language = LanguageTag::new_single(self.language_id, &mut context.pool()).await?;
+
+    let attachment = self
+      .url
+      .clone()
+      .map(|url| {
+        Attachment::new(
+          url.into(),
+          self.url_content_type.clone(),
+          self.alt_text.clone(),
+        )
+      })
+      .into_iter()
+      .collect();
 
     let page = Page {
       kind: PageType::Page,
@@ -118,13 +135,13 @@ impl Object for ApubPost {
       content: self.body.as_ref().map(|b| markdown_to_html(b)),
       media_type: Some(MediaTypeMarkdownOrHtml::Html),
       source: self.body.clone().map(Source::new),
-      attachment: self.url.clone().map(Attachment::new).into_iter().collect(),
+      attachment,
       image: self.thumbnail_url.clone().map(ImageObject::new),
       comments_enabled: Some(!self.locked),
       sensitive: Some(self.nsfw),
       language,
-      published: Some(convert_datetime(self.published)),
-      updated: self.updated.map(convert_datetime),
+      published: Some(self.published),
+      updated: self.updated,
       audience: Some(community.actor_id.into()),
       in_reply_to: None,
     };
@@ -148,7 +165,7 @@ impl Object for ApubPost {
     check_apub_id_valid_with_strictness(page.id.inner(), community.local, context).await?;
     verify_person_in_community(&page.creator()?, &community, context).await?;
 
-    let local_site_data = local_site_data_cached(context.pool()).await?;
+    let local_site_data = local_site_data_cached(&mut context.pool()).await?;
     let slur_regex = &local_site_opt_to_slur_regex(&local_site_data.local_site);
     check_slurs_opt(&page.name, slur_regex)?;
 
@@ -162,17 +179,27 @@ impl Object for ApubPost {
     let creator = page.creator()?.dereference(context).await?;
     let community = page.community(context).await?;
     if community.posting_restricted_to_mods {
-      is_mod_or_admin(context.pool(), creator.id, community.id).await?;
+      is_mod_or_admin(&mut context.pool(), &creator, community.id).await?;
     }
     let mut name = page
       .name
       .clone()
       .or_else(|| {
+        // Posts coming from Mastodon or similar platforms don't have a title. Instead we take the
+        // first line of the content and convert it from HTML to plaintext. We also remove mentions
+        // of the community name.
         page
           .content
-          .clone()
-          .as_ref()
-          .and_then(|c| parse_html(c).lines().next().map(ToString::to_string))
+          .as_deref()
+          .map(StringReader::new)
+          .map(|c| from_read_with_decorator(c, MAX_TITLE_LENGTH, TrivialDecorator::new()))
+          .and_then(|c| {
+            c.lines().next().map(|s| {
+              s.replace(&format!("@{}", community.name), "")
+                .trim()
+                .to_string()
+            })
+          })
       })
       .ok_or_else(|| anyhow!("Object must have name or content"))?;
     if name.chars().count() > MAX_TITLE_LENGTH {
@@ -182,10 +209,11 @@ impl Object for ApubPost {
     // read existing, local post if any (for generating mod log)
     let old_post = page.id.dereference_local(context).await;
 
+    let first_attachment = page.attachment.first();
+
     let form = if !page.is_mod_action(context).await? {
-      let first_attachment = page.attachment.into_iter().map(Attachment::url).next();
-      let url = if first_attachment.is_some() {
-        first_attachment
+      let url = if let Some(attachment) = first_attachment.cloned() {
+        Some(attachment.url())
       } else if page.kind == PageType::Video {
         // we cant display videos directly, so insert a link to external video page
         Some(page.id.inner().clone())
@@ -194,60 +222,52 @@ impl Object for ApubPost {
       };
       check_url_scheme(&url)?;
 
-      let local_site = LocalSite::read(context.pool()).await.ok();
+      let alt_text = first_attachment.cloned().and_then(Attachment::alt_text);
+      let local_site = LocalSite::read(&mut context.pool()).await.ok();
       let allow_sensitive = local_site_opt_to_sensitive(&local_site);
       let page_is_sensitive = page.sensitive.unwrap_or(false);
-      let include_image = allow_sensitive || !page_is_sensitive;
+      let allow_generate_thumbnail = allow_sensitive || !page_is_sensitive;
+      let mut thumbnail_url = page.image.map(|i| i.url);
+      let do_generate_thumbnail = thumbnail_url.is_none() && allow_generate_thumbnail;
 
-      // Only fetch metadata if the post has a url and was not seen previously. We dont want to
-      // waste resources by fetching metadata for the same post multiple times.
-      // Additionally, only fetch image if content is not sensitive or is allowed on local site.
-      let (metadata_res, thumbnail) = match &url {
-        Some(url) if old_post.is_err() => {
-          fetch_site_data(
-            context.client(),
-            context.settings(),
-            Some(url),
-            include_image,
-          )
-          .await
-        }
-        _ => (None, None),
-      };
-      // If no image was included with metadata, use post image instead when available.
-      let thumbnail_url = thumbnail.or_else(|| page.image.map(|i| i.url.into()));
+      // Generate local thumbnail only if no thumbnail was federated and 'sensitive' attributes allow it.
+      let metadata = fetch_link_metadata_opt(url.as_ref(), do_generate_thumbnail, context).await;
+      if let Some(thumbnail_url_) = metadata.thumbnail {
+        thumbnail_url = Some(thumbnail_url_.into());
+      }
+      let url = proxy_image_link_opt_apub(url, context).await?;
+      let thumbnail_url = proxy_image_link_opt_apub(thumbnail_url, context).await?;
 
-      let (embed_title, embed_description, embed_video_url) = metadata_res
-        .map(|u| (u.title, u.description, u.embed_video_url))
-        .unwrap_or_default();
       let slur_regex = &local_site_opt_to_slur_regex(&local_site);
 
-      let body_slurs_removed =
-        read_from_string_or_source_opt(&page.content, &page.media_type, &page.source)
-          .map(|s| remove_slurs(&s, slur_regex));
-      let language_id = LanguageTag::to_language_id_single(page.language, context.pool()).await?;
+      let body = read_from_string_or_source_opt(&page.content, &page.media_type, &page.source);
+      let body = process_markdown_opt(&body, slur_regex, context).await?;
+      let language_id =
+        LanguageTag::to_language_id_single(page.language, &mut context.pool()).await?;
 
       PostInsertForm {
         name,
         url: url.map(Into::into),
-        body: body_slurs_removed,
+        body,
+        alt_text,
         creator_id: creator.id,
         community_id: community.id,
         removed: None,
         locked: page.comments_enabled.map(|e| !e),
-        published: page.published.map(|u| u.naive_local()),
-        updated: page.updated.map(|u| u.naive_local()),
+        published: page.published.map(Into::into),
+        updated: page.updated.map(Into::into),
         deleted: Some(false),
         nsfw: page.sensitive,
-        embed_title,
-        embed_description,
-        embed_video_url,
+        embed_title: metadata.opengraph_data.title,
+        embed_description: metadata.opengraph_data.description,
+        embed_video_url: metadata.opengraph_data.embed_video_url,
         thumbnail_url,
         ap_id: Some(page.id.clone().into()),
         local: Some(false),
         language_id,
         featured_community: None,
         featured_local: None,
+        url_content_type: metadata.content_type,
       }
     } else {
       // if is mod action, only update locked/stickied fields, nothing else
@@ -257,11 +277,11 @@ impl Object for ApubPost {
         .community_id(community.id)
         .ap_id(Some(page.id.clone().into()))
         .locked(page.comments_enabled.map(|e| !e))
-        .updated(page.updated.map(|u| u.naive_local()))
+        .updated(page.updated.map(Into::into))
         .build()
     };
 
-    let post = Post::create(context.pool(), &form).await?;
+    let post = Post::create(&mut context.pool(), &form).await?;
 
     // write mod log entry for lock
     if Page::is_locked_changed(&old_post, &page.comments_enabled) {
@@ -270,7 +290,7 @@ impl Object for ApubPost {
         post_id: post.id,
         locked: Some(post.locked),
       };
-      ModLockPost::create(context.pool(), &form).await?;
+      ModLockPost::create(&mut context.pool(), &form).await?;
     }
 
     Ok(post.into())
@@ -282,41 +302,68 @@ mod tests {
   use super::*;
   use crate::{
     objects::{
-      community::tests::parse_lemmy_community,
-      person::tests::parse_lemmy_person,
-      post::ApubPost,
-      tests::init_context,
+      community::{tests::parse_lemmy_community, ApubCommunity},
+      instance::ApubSite,
+      person::{tests::parse_lemmy_person, ApubPerson},
     },
     protocol::tests::file_to_json_object,
   };
   use lemmy_db_schema::source::site::Site;
+  use lemmy_utils::error::LemmyResult;
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]
   #[serial]
-  async fn test_parse_lemmy_post() {
-    let context = init_context().await;
-    let (person, site) = parse_lemmy_person(&context).await;
-    let community = parse_lemmy_community(&context).await;
+  async fn test_parse_lemmy_post() -> LemmyResult<()> {
+    let context = LemmyContext::init_test_context().await;
+    let (person, site) = parse_lemmy_person(&context).await?;
+    let community = parse_lemmy_community(&context).await?;
 
-    let json = file_to_json_object("assets/lemmy/objects/page.json").unwrap();
-    let url = Url::parse("https://enterprise.lemmy.ml/post/55143").unwrap();
-    ApubPost::verify(&json, &url, &context).await.unwrap();
-    let post = ApubPost::from_json(json, &context).await.unwrap();
+    let json = file_to_json_object("assets/lemmy/objects/page.json")?;
+    let url = Url::parse("https://enterprise.lemmy.ml/post/55143")?;
+    ApubPost::verify(&json, &url, &context).await?;
+    let post = ApubPost::from_json(json, &context).await?;
 
     assert_eq!(post.ap_id, url.into());
     assert_eq!(post.name, "Post title");
     assert!(post.body.is_some());
-    assert_eq!(post.body.as_ref().unwrap().len(), 45);
+    assert_eq!(post.body.as_ref().map(std::string::String::len), Some(45));
     assert!(!post.locked);
     assert!(!post.featured_community);
     assert_eq!(context.request_count(), 0);
 
-    Post::delete(context.pool(), post.id).await.unwrap();
-    Person::delete(context.pool(), person.id).await.unwrap();
-    Community::delete(context.pool(), community.id)
-      .await
-      .unwrap();
-    Site::delete(context.pool(), site.id).await.unwrap();
+    cleanup(&context, person, site, community, post).await?;
+    Ok(())
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_convert_mastodon_post_title() -> LemmyResult<()> {
+    let context = LemmyContext::init_test_context().await;
+    let (person, site) = parse_lemmy_person(&context).await?;
+    let community = parse_lemmy_community(&context).await?;
+
+    let json = file_to_json_object("assets/mastodon/objects/page.json")?;
+    let post = ApubPost::from_json(json, &context).await?;
+
+    assert_eq!(post.name, "Variable never resetting at refresh");
+
+    cleanup(&context, person, site, community, post).await?;
+    Ok(())
+  }
+
+  async fn cleanup(
+    context: &Data<LemmyContext>,
+    person: ApubPerson,
+    site: ApubSite,
+    community: ApubCommunity,
+    post: ApubPost,
+  ) -> LemmyResult<()> {
+    Post::delete(&mut context.pool(), post.id).await?;
+    Person::delete(&mut context.pool(), person.id).await?;
+    Community::delete(&mut context.pool(), community.id).await?;
+    Site::delete(&mut context.pool(), site.id).await?;
+    Ok(())
   }
 }

@@ -1,10 +1,12 @@
-use crate::Perform;
-use actix_web::web::Data;
+use activitypub_federation::config::Data;
+use actix_web::web::Json;
 use lemmy_api_common::{
   context::LemmyContext,
   request::purge_image_from_pictrs,
-  site::{PurgeItemResponse, PurgePost},
-  utils::{is_admin, local_user_view_from_jwt},
+  send_activity::{ActivityChannel, SendActivityData},
+  site::PurgePost,
+  utils::is_admin,
+  SuccessResponse,
 };
 use lemmy_db_schema::{
   source::{
@@ -13,52 +15,50 @@ use lemmy_db_schema::{
   },
   traits::Crud,
 };
+use lemmy_db_views::structs::LocalUserView;
 use lemmy_utils::error::LemmyError;
 
-#[async_trait::async_trait(?Send)]
-impl Perform for PurgePost {
-  type Response = PurgeItemResponse;
+#[tracing::instrument(skip(context))]
+pub async fn purge_post(
+  data: Json<PurgePost>,
+  context: Data<LemmyContext>,
+  local_user_view: LocalUserView,
+) -> Result<Json<SuccessResponse>, LemmyError> {
+  // Only let admin purge an item
+  is_admin(&local_user_view)?;
 
-  #[tracing::instrument(skip(context))]
-  async fn perform(&self, context: &Data<LemmyContext>) -> Result<Self::Response, LemmyError> {
-    let data: &Self = self;
-    let local_user_view = local_user_view_from_jwt(&data.auth, context).await?;
+  // Read the post to get the community_id
+  let post = Post::read(&mut context.pool(), data.post_id).await?;
 
-    // Only let admin purge an item
-    is_admin(&local_user_view)?;
-
-    let post_id = data.post_id;
-
-    // Read the post to get the community_id
-    let post = Post::read(context.pool(), post_id).await?;
-
-    // Purge image
-    if let Some(url) = post.url {
-      purge_image_from_pictrs(context.client(), context.settings(), &url)
-        .await
-        .ok();
-    }
-    // Purge thumbnail
-    if let Some(thumbnail_url) = post.thumbnail_url {
-      purge_image_from_pictrs(context.client(), context.settings(), &thumbnail_url)
-        .await
-        .ok();
-    }
-
-    let community_id = post.community_id;
-
-    Post::delete(context.pool(), post_id).await?;
-
-    // Mod tables
-    let reason = data.reason.clone();
-    let form = AdminPurgePostForm {
-      admin_person_id: local_user_view.person.id,
-      reason,
-      community_id,
-    };
-
-    AdminPurgePost::create(context.pool(), &form).await?;
-
-    Ok(PurgeItemResponse { success: true })
+  // Purge image
+  if let Some(url) = &post.url {
+    purge_image_from_pictrs(url, &context).await.ok();
   }
+  // Purge thumbnail
+  if let Some(thumbnail_url) = &post.thumbnail_url {
+    purge_image_from_pictrs(thumbnail_url, &context).await.ok();
+  }
+
+  Post::delete(&mut context.pool(), data.post_id).await?;
+
+  // Mod tables
+  let form = AdminPurgePostForm {
+    admin_person_id: local_user_view.person.id,
+    reason: data.reason.clone(),
+    community_id: post.community_id,
+  };
+  AdminPurgePost::create(&mut context.pool(), &form).await?;
+
+  ActivityChannel::submit_activity(
+    SendActivityData::RemovePost {
+      post,
+      moderator: local_user_view.person.clone(),
+      reason: data.reason.clone(),
+      removed: true,
+    },
+    &context,
+  )
+  .await?;
+
+  Ok(Json(SuccessResponse::default()))
 }

@@ -27,7 +27,7 @@ use lemmy_utils::error::LemmyError;
 use url::Url;
 
 #[derive(Clone, Debug)]
-pub(crate) struct ApubCommunityOutbox(Vec<ApubPost>);
+pub(crate) struct ApubCommunityOutbox(());
 
 #[async_trait::async_trait]
 impl Collection for ApubCommunityOutbox {
@@ -41,14 +41,16 @@ impl Collection for ApubCommunityOutbox {
     owner: &Self::Owner,
     data: &Data<Self::DataType>,
   ) -> Result<Self::Kind, LemmyError> {
-    let post_list: Vec<ApubPost> = Post::list_for_community(data.pool(), owner.id)
+    let post_list: Vec<ApubPost> = Post::list_for_community(&mut data.pool(), owner.id)
       .await?
       .into_iter()
       .map(Into::into)
       .collect();
     let mut ordered_items = vec![];
     for post in post_list {
-      let person = Person::read(data.pool(), post.creator_id).await?.into();
+      let person = Person::read(&mut data.pool(), post.creator_id)
+        .await?
+        .into();
       let create =
         CreateOrUpdatePage::new(post, &person, owner, CreateOrUpdateType::Create, data).await?;
       let announcable = AnnouncableActivities::CreateOrUpdatePost(create);
@@ -94,17 +96,21 @@ impl Collection for ApubCommunityOutbox {
     // process items in parallel, to avoid long delay from fetch_site_metadata() and other processing
     join_all(outbox_activities.into_iter().map(|activity| {
       async {
-        // use separate request counter for each item, otherwise there will be problems with
-        // parallel processing
-        let verify = activity.verify(data).await;
-        if verify.is_ok() {
-          activity.receive(data).await.ok();
+        // Receiving announce requires at least one local community follower for anti spam purposes.
+        // This won't be the case for newly fetched communities, so we extract the inner activity
+        // and handle it directly to bypass this check.
+        let inner = activity.object.object(data).await.map(TryInto::try_into);
+        if let Ok(Ok(AnnouncableActivities::CreateOrUpdatePost(inner))) = inner {
+          let verify = inner.verify(data).await;
+          if verify.is_ok() {
+            inner.receive(data).await.ok();
+          }
         }
       }
     }))
     .await;
 
     // This return value is unused, so just set an empty vec
-    Ok(ApubCommunityOutbox(Vec::new()))
+    Ok(ApubCommunityOutbox(()))
   }
 }

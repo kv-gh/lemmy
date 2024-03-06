@@ -68,19 +68,14 @@ pub async fn send_email(
   // is bad.
 
   // Set the TLS
-  let builder_dangerous = AsyncSmtpTransport::builder_dangerous(smtp_server).port(smtp_port);
-
   let mut builder = match email_config.tls_type.as_str() {
-    "starttls" => AsyncSmtpTransport::starttls_relay(smtp_server)?,
-    "tls" => AsyncSmtpTransport::relay(smtp_server)?,
-    _ => builder_dangerous,
+    "starttls" => AsyncSmtpTransport::starttls_relay(smtp_server)?.port(smtp_port),
+    "tls" => AsyncSmtpTransport::relay(smtp_server)?.port(smtp_port),
+    _ => AsyncSmtpTransport::builder_dangerous(smtp_server).port(smtp_port),
   };
 
   // Set the creds if they exist
-  let smtp_password = std::env::var("LEMMY_SMTP_PASSWORD")
-    .ok()
-    .or(email_config.smtp_password);
-
+  let smtp_password = email_config.smtp_password();
   if let (Some(username), Some(password)) = (email_config.smtp_login, smtp_password) {
     builder = builder.credentials(Credentials::new(username, password));
   }

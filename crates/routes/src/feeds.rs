@@ -1,13 +1,13 @@
+use crate::local_user_view_from_jwt;
 use actix_web::{error::ErrorBadRequest, web, Error, HttpRequest, HttpResponse, Result};
 use anyhow::anyhow;
-use chrono::{DateTime, NaiveDateTime, Utc};
-use lemmy_api_common::context::LemmyContext;
+use chrono::{DateTime, Utc};
+use lemmy_api_common::{context::LemmyContext, utils::check_private_instance};
 use lemmy_db_schema::{
-  newtypes::LocalUserId,
-  source::{community::Community, local_user::LocalUser, person::Person},
-  traits::{ApubActor, Crud},
-  utils::DbPool,
+  source::{community::Community, person::Person},
+  traits::ApubActor,
   CommentSortType,
+  CommunityVisibility,
   ListingType,
   SortType,
 };
@@ -20,14 +20,18 @@ use lemmy_db_views_actor::{
   person_mention_view::PersonMentionQuery,
   structs::{CommentReplyView, PersonMentionView},
 };
-use lemmy_utils::{claims::Claims, error::LemmyError, utils::markdown::markdown_to_html};
+use lemmy_utils::{
+  cache_header::cache_1hour,
+  error::{LemmyError, LemmyErrorType},
+  utils::markdown::{markdown_to_html, sanitize_html},
+};
 use once_cell::sync::Lazy;
 use rss::{
-  extension::dublincore::DublinCoreExtensionBuilder,
-  ChannelBuilder,
-  GuidBuilder,
+  extension::{dublincore::DublinCoreExtension, ExtensionBuilder, ExtensionMap},
+  Channel,
+  EnclosureBuilder,
+  Guid,
   Item,
-  ItemBuilder,
 };
 use serde::Deserialize;
 use std::{collections::BTreeMap, str::FromStr};
@@ -65,10 +69,15 @@ enum RequestType {
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-  cfg
-    .route("/feeds/{type}/{name}.xml", web::get().to(get_feed))
-    .route("/feeds/all.xml", web::get().to(get_all_feed))
-    .route("/feeds/local.xml", web::get().to(get_local_feed));
+  cfg.service(
+    web::scope("/feeds")
+      .route("/{type}/{name}.xml", web::get().to(get_feed))
+      .route("/all.xml", web::get().to(get_all_feed).wrap(cache_1hour()))
+      .route(
+        "/local.xml",
+        web::get().to(get_local_feed).wrap(cache_1hour()),
+      ),
+  );
 }
 
 static RSS_NAMESPACE: Lazy<BTreeMap<String, String>> = Lazy::new(|| {
@@ -77,8 +86,29 @@ static RSS_NAMESPACE: Lazy<BTreeMap<String, String>> = Lazy::new(|| {
     "dc".to_string(),
     rss::extension::dublincore::NAMESPACE.to_string(),
   );
+  h.insert(
+    "media".to_string(),
+    "http://search.yahoo.com/mrss/".to_string(),
+  );
   h
 });
+
+/// Removes any characters disallowed by the XML grammar.
+/// See https://www.w3.org/TR/xml/#NT-Char for details.
+fn sanitize_xml(input: String) -> String {
+  input
+    .chars()
+    .filter(|&c| {
+      matches!(c,
+        '\u{09}'
+        | '\u{0A}'
+        | '\u{0D}'
+        | '\u{20}'..='\u{D7FF}'
+        | '\u{E000}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{10FFFF}')
+    })
+    .collect()
+}
 
 #[tracing::instrument(skip_all)]
 async fn get_all_feed(
@@ -122,32 +152,35 @@ async fn get_feed_data(
   limit: i64,
   page: i64,
 ) -> Result<HttpResponse, LemmyError> {
-  let site_view = SiteView::read_local(context.pool()).await?;
+  let site_view = SiteView::read_local(&mut context.pool()).await?;
 
-  let posts = PostQuery::builder()
-    .pool(context.pool())
-    .listing_type(Some(listing_type))
-    .sort(Some(sort_type))
-    .limit(Some(limit))
-    .page(Some(page))
-    .build()
-    .list()
-    .await?;
+  check_private_instance(&None, &site_view.local_site)?;
+
+  let posts = PostQuery {
+    listing_type: (Some(listing_type)),
+    sort: (Some(sort_type)),
+    limit: (Some(limit)),
+    page: (Some(page)),
+    ..Default::default()
+  }
+  .list(&site_view.site, &mut context.pool())
+  .await?;
 
   let items = create_post_items(posts, &context.settings().get_protocol_and_hostname())?;
 
-  let mut channel_builder = ChannelBuilder::default();
-  channel_builder
-    .namespaces(RSS_NAMESPACE.clone())
-    .title(&format!("{} - {}", site_view.site.name, listing_type))
-    .link(context.settings().get_protocol_and_hostname())
-    .items(items);
+  let mut channel = Channel {
+    namespaces: RSS_NAMESPACE.clone(),
+    title: format!("{} - {}", site_view.site.name, listing_type),
+    link: context.settings().get_protocol_and_hostname(),
+    items,
+    ..Default::default()
+  };
 
   if let Some(site_desc) = site_view.site.description {
-    channel_builder.description(&site_desc);
+    channel.set_description(&site_desc);
   }
 
-  let rss = channel_builder.build().to_string();
+  let rss = channel.to_string();
   Ok(
     HttpResponse::Ok()
       .content_type("application/rss+xml")
@@ -172,51 +205,42 @@ async fn get_feed(
     _ => return Err(ErrorBadRequest(LemmyError::from(anyhow!("wrong_type")))),
   };
 
-  let jwt_secret = context.secret().jwt_secret.clone();
-  let protocol_and_hostname = context.settings().get_protocol_and_hostname();
-
   let builder = match request_type {
     RequestType::User => {
       get_feed_user(
-        context.pool(),
+        &context,
         &info.sort_type()?,
         &info.get_limit(),
         &info.get_page(),
         &param,
-        &protocol_and_hostname,
       )
       .await
     }
     RequestType::Community => {
       get_feed_community(
-        context.pool(),
+        &context,
         &info.sort_type()?,
         &info.get_limit(),
         &info.get_page(),
         &param,
-        &protocol_and_hostname,
       )
       .await
     }
     RequestType::Front => {
       get_feed_front(
-        context.pool(),
-        &jwt_secret,
+        &context,
         &info.sort_type()?,
         &info.get_limit(),
         &info.get_page(),
         &param,
-        &protocol_and_hostname,
       )
       .await
     }
-    RequestType::Inbox => {
-      get_feed_inbox(context.pool(), &jwt_secret, &param, &protocol_and_hostname).await
-    }
+    RequestType::Inbox => get_feed_inbox(&context, &param).await,
   }
   .map_err(ErrorBadRequest)?;
 
-  let rss = builder.build().to_string();
+  let rss = builder.to_string();
 
   Ok(
     HttpResponse::Ok()
@@ -227,169 +251,173 @@ async fn get_feed(
 
 #[tracing::instrument(skip_all)]
 async fn get_feed_user(
-  pool: &DbPool,
+  context: &LemmyContext,
   sort_type: &SortType,
   limit: &i64,
   page: &i64,
   user_name: &str,
-  protocol_and_hostname: &str,
-) -> Result<ChannelBuilder, LemmyError> {
-  let site_view = SiteView::read_local(pool).await?;
-  let person = Person::read_from_name(pool, user_name, false).await?;
+) -> Result<Channel, LemmyError> {
+  let site_view = SiteView::read_local(&mut context.pool()).await?;
+  let person = Person::read_from_name(&mut context.pool(), user_name, false).await?;
 
-  let posts = PostQuery::builder()
-    .pool(pool)
-    .listing_type(Some(ListingType::All))
-    .sort(Some(*sort_type))
-    .creator_id(Some(person.id))
-    .limit(Some(*limit))
-    .page(Some(*page))
-    .build()
-    .list()
-    .await?;
+  check_private_instance(&None, &site_view.local_site)?;
 
-  let items = create_post_items(posts, protocol_and_hostname)?;
+  let posts = PostQuery {
+    listing_type: (Some(ListingType::All)),
+    sort: (Some(*sort_type)),
+    creator_id: (Some(person.id)),
+    limit: (Some(*limit)),
+    page: (Some(*page)),
+    ..Default::default()
+  }
+  .list(&site_view.site, &mut context.pool())
+  .await?;
 
-  let mut channel_builder = ChannelBuilder::default();
-  channel_builder
-    .namespaces(RSS_NAMESPACE.clone())
-    .title(&format!("{} - {}", site_view.site.name, person.name))
-    .link(person.actor_id.to_string())
-    .items(items);
+  let items = create_post_items(posts, &context.settings().get_protocol_and_hostname())?;
+  let channel = Channel {
+    namespaces: RSS_NAMESPACE.clone(),
+    title: format!("{} - {}", sanitize_xml(site_view.site.name), person.name),
+    link: person.actor_id.to_string(),
+    items,
+    ..Default::default()
+  };
 
-  Ok(channel_builder)
+  Ok(channel)
 }
 
 #[tracing::instrument(skip_all)]
 async fn get_feed_community(
-  pool: &DbPool,
+  context: &LemmyContext,
   sort_type: &SortType,
   limit: &i64,
   page: &i64,
   community_name: &str,
-  protocol_and_hostname: &str,
-) -> Result<ChannelBuilder, LemmyError> {
-  let site_view = SiteView::read_local(pool).await?;
-  let community = Community::read_from_name(pool, community_name, false).await?;
-
-  let posts = PostQuery::builder()
-    .pool(pool)
-    .sort(Some(*sort_type))
-    .community_id(Some(community.id))
-    .limit(Some(*limit))
-    .page(Some(*page))
-    .build()
-    .list()
-    .await?;
-
-  let items = create_post_items(posts, protocol_and_hostname)?;
-
-  let mut channel_builder = ChannelBuilder::default();
-  channel_builder
-    .namespaces(RSS_NAMESPACE.clone())
-    .title(&format!("{} - {}", site_view.site.name, community.name))
-    .link(community.actor_id.to_string())
-    .items(items);
-
-  if let Some(community_desc) = community.description {
-    channel_builder.description(&community_desc);
+) -> Result<Channel, LemmyError> {
+  let site_view = SiteView::read_local(&mut context.pool()).await?;
+  let community = Community::read_from_name(&mut context.pool(), community_name, false).await?;
+  if community.visibility != CommunityVisibility::Public {
+    return Err(LemmyErrorType::CouldntFindCommunity.into());
   }
 
-  Ok(channel_builder)
+  check_private_instance(&None, &site_view.local_site)?;
+
+  let posts = PostQuery {
+    sort: (Some(*sort_type)),
+    community_id: (Some(community.id)),
+    limit: (Some(*limit)),
+    page: (Some(*page)),
+    ..Default::default()
+  }
+  .list(&site_view.site, &mut context.pool())
+  .await?;
+
+  let items = create_post_items(posts, &context.settings().get_protocol_and_hostname())?;
+
+  let mut channel = Channel {
+    namespaces: RSS_NAMESPACE.clone(),
+    title: format!("{} - {}", sanitize_xml(site_view.site.name), community.name),
+    link: community.actor_id.to_string(),
+    items,
+    ..Default::default()
+  };
+
+  if let Some(community_desc) = community.description {
+    channel.set_description(markdown_to_html(&community_desc));
+  }
+
+  Ok(channel)
 }
 
 #[tracing::instrument(skip_all)]
 async fn get_feed_front(
-  pool: &DbPool,
-  jwt_secret: &str,
+  context: &LemmyContext,
   sort_type: &SortType,
   limit: &i64,
   page: &i64,
   jwt: &str,
-  protocol_and_hostname: &str,
-) -> Result<ChannelBuilder, LemmyError> {
-  let site_view = SiteView::read_local(pool).await?;
-  let local_user_id = LocalUserId(Claims::decode(jwt, jwt_secret)?.claims.sub);
-  let local_user = LocalUser::read(pool, local_user_id).await?;
+) -> Result<Channel, LemmyError> {
+  let site_view = SiteView::read_local(&mut context.pool()).await?;
+  let local_user = local_user_view_from_jwt(jwt, context).await?;
 
-  let posts = PostQuery::builder()
-    .pool(pool)
-    .listing_type(Some(ListingType::Subscribed))
-    .local_user(Some(&local_user))
-    .sort(Some(*sort_type))
-    .limit(Some(*limit))
-    .page(Some(*page))
-    .build()
-    .list()
-    .await?;
+  check_private_instance(&Some(local_user.clone()), &site_view.local_site)?;
 
-  let items = create_post_items(posts, protocol_and_hostname)?;
+  let posts = PostQuery {
+    listing_type: (Some(ListingType::Subscribed)),
+    local_user: (Some(&local_user)),
+    sort: (Some(*sort_type)),
+    limit: (Some(*limit)),
+    page: (Some(*page)),
+    ..Default::default()
+  }
+  .list(&site_view.site, &mut context.pool())
+  .await?;
 
-  let mut channel_builder = ChannelBuilder::default();
-  channel_builder
-    .namespaces(RSS_NAMESPACE.clone())
-    .title(&format!("{} - Subscribed", site_view.site.name))
-    .link(protocol_and_hostname)
-    .items(items);
+  let protocol_and_hostname = context.settings().get_protocol_and_hostname();
+  let items = create_post_items(posts, &protocol_and_hostname)?;
+  let mut channel = Channel {
+    namespaces: RSS_NAMESPACE.clone(),
+    title: format!("{} - Subscribed", sanitize_xml(site_view.site.name)),
+    link: protocol_and_hostname,
+    items,
+    ..Default::default()
+  };
 
   if let Some(site_desc) = site_view.site.description {
-    channel_builder.description(&site_desc);
+    channel.set_description(markdown_to_html(&site_desc));
   }
 
-  Ok(channel_builder)
+  Ok(channel)
 }
 
 #[tracing::instrument(skip_all)]
-async fn get_feed_inbox(
-  pool: &DbPool,
-  jwt_secret: &str,
-  jwt: &str,
-  protocol_and_hostname: &str,
-) -> Result<ChannelBuilder, LemmyError> {
-  let site_view = SiteView::read_local(pool).await?;
-  let local_user_id = LocalUserId(Claims::decode(jwt, jwt_secret)?.claims.sub);
-  let local_user = LocalUser::read(pool, local_user_id).await?;
-  let person_id = local_user.person_id;
-  let show_bot_accounts = local_user.show_bot_accounts;
+async fn get_feed_inbox(context: &LemmyContext, jwt: &str) -> Result<Channel, LemmyError> {
+  let site_view = SiteView::read_local(&mut context.pool()).await?;
+  let local_user = local_user_view_from_jwt(jwt, context).await?;
+  let person_id = local_user.local_user.person_id;
+  let show_bot_accounts = local_user.local_user.show_bot_accounts;
 
   let sort = CommentSortType::New;
 
-  let replies = CommentReplyQuery::builder()
-    .pool(pool)
-    .recipient_id(Some(person_id))
-    .my_person_id(Some(person_id))
-    .show_bot_accounts(Some(show_bot_accounts))
-    .sort(Some(sort))
-    .limit(Some(RSS_FETCH_LIMIT))
-    .build()
-    .list()
-    .await?;
+  check_private_instance(&Some(local_user.clone()), &site_view.local_site)?;
 
-  let mentions = PersonMentionQuery::builder()
-    .pool(pool)
-    .recipient_id(Some(person_id))
-    .my_person_id(Some(person_id))
-    .show_bot_accounts(Some(show_bot_accounts))
-    .sort(Some(sort))
-    .limit(Some(RSS_FETCH_LIMIT))
-    .build()
-    .list()
-    .await?;
+  let replies = CommentReplyQuery {
+    recipient_id: (Some(person_id)),
+    my_person_id: (Some(person_id)),
+    show_bot_accounts: (show_bot_accounts),
+    sort: (Some(sort)),
+    limit: (Some(RSS_FETCH_LIMIT)),
+    ..Default::default()
+  }
+  .list(&mut context.pool())
+  .await?;
 
-  let items = create_reply_and_mention_items(replies, mentions, protocol_and_hostname)?;
+  let mentions = PersonMentionQuery {
+    recipient_id: (Some(person_id)),
+    my_person_id: (Some(person_id)),
+    show_bot_accounts: (show_bot_accounts),
+    sort: (Some(sort)),
+    limit: (Some(RSS_FETCH_LIMIT)),
+    ..Default::default()
+  }
+  .list(&mut context.pool())
+  .await?;
 
-  let mut channel_builder = ChannelBuilder::default();
-  channel_builder
-    .namespaces(RSS_NAMESPACE.clone())
-    .title(&format!("{} - Inbox", site_view.site.name))
-    .link(format!("{protocol_and_hostname}/inbox",))
-    .items(items);
+  let protocol_and_hostname = context.settings().get_protocol_and_hostname();
+  let items = create_reply_and_mention_items(replies, mentions, &protocol_and_hostname)?;
+
+  let mut channel = Channel {
+    namespaces: RSS_NAMESPACE.clone(),
+    title: format!("{} - Inbox", sanitize_xml(site_view.site.name)),
+    link: format!("{protocol_and_hostname}/inbox"),
+    items,
+    ..Default::default()
+  };
 
   if let Some(site_desc) = site_view.site.description {
-    channel_builder.description(&site_desc);
+    channel.set_description(&site_desc);
   }
 
-  Ok(channel_builder)
+  Ok(channel)
 }
 
 #[tracing::instrument(skip_all)]
@@ -433,27 +461,31 @@ fn create_reply_and_mention_items(
 #[tracing::instrument(skip_all)]
 fn build_item(
   creator_name: &str,
-  published: &NaiveDateTime,
+  published: &DateTime<Utc>,
   url: &str,
   content: &str,
   protocol_and_hostname: &str,
 ) -> Result<Item, LemmyError> {
-  let mut i = ItemBuilder::default();
-  i.title(format!("Reply from {creator_name}"));
-  let author_url = format!("{protocol_and_hostname}/u/{creator_name}");
-  i.author(format!(
-    "/u/{creator_name} <a href=\"{author_url}\">(link)</a>"
-  ));
-  let dt = DateTime::<Utc>::from_utc(*published, Utc);
-  i.pub_date(dt.to_rfc2822());
-  i.comments(url.to_owned());
-  let guid = GuidBuilder::default().permalink(true).value(url).build();
-  i.guid(guid);
-  i.link(url.to_owned());
   // TODO add images
-  let html = markdown_to_html(content);
-  i.description(html);
-  Ok(i.build())
+  let author_url = format!("{protocol_and_hostname}/u/{creator_name}");
+  let guid = Some(Guid {
+    permalink: true,
+    value: url.to_owned(),
+  });
+  let description = Some(markdown_to_html(content));
+
+  Ok(Item {
+    title: Some(format!("Reply from {creator_name}")),
+    author: Some(format!(
+      "/u/{creator_name} <a href=\"{author_url}\">(link)</a>"
+    )),
+    pub_date: Some(published.to_rfc2822()),
+    comments: Some(url.to_owned()),
+    link: Some(url.to_owned()),
+    guid,
+    description,
+    ..Default::default()
+  })
 }
 
 #[tracing::instrument(skip_all)]
@@ -464,54 +496,84 @@ fn create_post_items(
   let mut items: Vec<Item> = Vec::new();
 
   for p in posts {
-    let mut i = ItemBuilder::default();
-    let mut dc_extension = DublinCoreExtensionBuilder::default();
-
-    i.title(p.post.name);
-
-    dc_extension.creators(vec![p.creator.actor_id.to_string()]);
-
-    let dt = DateTime::<Utc>::from_utc(p.post.published, Utc);
-    i.pub_date(dt.to_rfc2822());
-
     let post_url = format!("{}/post/{}", protocol_and_hostname, p.post.id);
-    i.comments(post_url.clone());
-    let guid = GuidBuilder::default()
-      .permalink(true)
-      .value(&post_url)
-      .build();
-    i.guid(guid);
-
-    let community_url = format!("{}/c/{}", protocol_and_hostname, p.community.name);
-
-    // TODO add images
+    let community_url = format!(
+      "{}/c/{}",
+      protocol_and_hostname,
+      sanitize_html(&p.community.name)
+    );
+    let dublin_core_ext = Some(DublinCoreExtension {
+      creators: vec![p.creator.actor_id.to_string()],
+      ..DublinCoreExtension::default()
+    });
+    let guid = Some(Guid {
+      permalink: true,
+      value: post_url.clone(),
+    });
     let mut description = format!("submitted by <a href=\"{}\">{}</a> to <a href=\"{}\">{}</a><br>{} points | <a href=\"{}\">{} comments</a>",
     p.creator.actor_id,
-    p.creator.name,
+    sanitize_html(&p.creator.name),
     community_url,
-    p.community.name,
+    sanitize_html(&p.community.name),
     p.counts.score,
     post_url,
     p.counts.comments);
 
     // If its a url post, add it to the description
-    if let Some(url) = p.post.url {
+    // and see if we can parse it as a media enclosure.
+    let enclosure_opt = p.post.url.map(|url| {
       let link_html = format!("<br><a href=\"{url}\">{url}</a>");
       description.push_str(&link_html);
-      i.link(url.to_string());
-    } else {
-      i.link(post_url.clone());
-    }
+
+      let mime_type = p
+        .post
+        .url_content_type
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+      let mut enclosure_bld = EnclosureBuilder::default();
+
+      enclosure_bld.url(url.as_str().to_string());
+      enclosure_bld.mime_type(mime_type);
+      enclosure_bld.length("0".to_string());
+      enclosure_bld.build()
+    });
 
     if let Some(body) = p.post.body {
       let html = markdown_to_html(&body);
       description.push_str(&html);
     }
 
-    i.description(description);
+    let mut extensions = ExtensionMap::new();
 
-    i.dublin_core_ext(dc_extension.build());
-    items.push(i.build());
+    // If there's a thumbnail URL, add a media:content tag to display it.
+    // See https://www.rssboard.org/media-rss#media-content for details.
+    if let Some(url) = p.post.thumbnail_url {
+      let mut thumbnail_ext = ExtensionBuilder::default();
+      thumbnail_ext.name("media:content".to_string());
+      thumbnail_ext.attrs(BTreeMap::from([
+        ("url".to_string(), url.to_string()),
+        ("medium".to_string(), "image".to_string()),
+      ]));
+
+      extensions.insert(
+        "media".to_string(),
+        BTreeMap::from([("content".to_string(), vec![thumbnail_ext.build()])]),
+      );
+    }
+
+    let i = Item {
+      title: Some(sanitize_html(sanitize_xml(p.post.name).as_str())),
+      pub_date: Some(p.post.published.to_rfc2822()),
+      comments: Some(post_url.clone()),
+      guid,
+      description: Some(sanitize_xml(description)),
+      dublin_core_ext,
+      link: Some(post_url.clone()),
+      extensions,
+      enclosure: enclosure_opt,
+      ..Default::default()
+    };
+
+    items.push(i);
   }
 
   Ok(items)

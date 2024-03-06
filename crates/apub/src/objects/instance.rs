@@ -1,4 +1,5 @@
 use crate::{
+  activities::GetActorType,
   check_apub_id_valid_with_strictness,
   local_site_data_cached,
   objects::read_from_string_or_source_opt,
@@ -15,24 +16,28 @@ use activitypub_federation::{
   protocol::{values::MediaTypeHtml, verification::verify_domains_match},
   traits::{Actor, Object},
 };
-use chrono::NaiveDateTime;
-use lemmy_api_common::{context::LemmyContext, utils::local_site_opt_to_slur_regex};
+use chrono::{DateTime, Utc};
+use lemmy_api_common::{
+  context::LemmyContext,
+  utils::{local_site_opt_to_slur_regex, process_markdown_opt, proxy_image_link_opt_apub},
+};
 use lemmy_db_schema::{
   newtypes::InstanceId,
   source::{
+    activity::ActorType,
     actor_language::SiteLanguage,
     instance::Instance as DbInstance,
+    local_site::LocalSite,
     site::{Site, SiteInsertForm},
   },
   traits::Crud,
-  utils::{naive_now, DbPool},
+  utils::naive_now,
 };
 use lemmy_utils::{
   error::LemmyError,
   utils::{
     markdown::markdown_to_html,
     slurs::{check_slurs, check_slurs_opt},
-    time::convert_datetime,
   },
 };
 use std::ops::Deref;
@@ -61,7 +66,7 @@ impl Object for ApubSite {
   type Kind = Instance;
   type Error = LemmyError;
 
-  fn last_refreshed_at(&self) -> Option<NaiveDateTime> {
+  fn last_refreshed_at(&self) -> Option<DateTime<Utc>> {
     Some(self.last_refreshed_at)
   }
 
@@ -71,7 +76,7 @@ impl Object for ApubSite {
     data: &Data<Self::DataType>,
   ) -> Result<Option<Self>, LemmyError> {
     Ok(
-      Site::read_from_apub_id(data.pool(), &object_id.into())
+      Site::read_from_apub_id(&mut data.pool(), &object_id.into())
         .await?
         .map(Into::into),
     )
@@ -84,8 +89,8 @@ impl Object for ApubSite {
   #[tracing::instrument(skip_all)]
   async fn into_json(self, data: &Data<Self::DataType>) -> Result<Self::Kind, LemmyError> {
     let site_id = self.id;
-    let langs = SiteLanguage::read(data.pool(), site_id).await?;
-    let language = LanguageTag::new_multiple(langs, data.pool()).await?;
+    let langs = SiteLanguage::read(&mut data.pool(), site_id).await?;
+    let language = LanguageTag::new_multiple(langs, &mut data.pool()).await?;
 
     let instance = Instance {
       kind: ApplicationType::Application,
@@ -101,8 +106,9 @@ impl Object for ApubSite {
       outbox: Url::parse(&format!("{}/site_outbox", self.actor_id))?,
       public_key: self.public_key(),
       language,
-      published: convert_datetime(self.published),
-      updated: self.updated.map(convert_datetime),
+      content_warning: self.content_warning.clone(),
+      published: self.published,
+      updated: self.updated,
     };
     Ok(instance)
   }
@@ -116,7 +122,7 @@ impl Object for ApubSite {
     check_apub_id_valid_with_strictness(apub.id.inner(), true, data).await?;
     verify_domains_match(expected_domain, apub.id.inner())?;
 
-    let local_site_data = local_site_data_cached(data.pool()).await?;
+    let local_site_data = local_site_data_cached(&mut data.pool()).await?;
     let slur_regex = &local_site_opt_to_slur_regex(&local_site_data.local_site);
     check_slurs(&apub.name, slur_regex)?;
     check_slurs_opt(&apub.summary, slur_regex)?;
@@ -125,28 +131,37 @@ impl Object for ApubSite {
   }
 
   #[tracing::instrument(skip_all)]
-  async fn from_json(apub: Self::Kind, data: &Data<Self::DataType>) -> Result<Self, LemmyError> {
+  async fn from_json(apub: Self::Kind, context: &Data<Self::DataType>) -> Result<Self, LemmyError> {
     let domain = apub.id.inner().domain().expect("group id has domain");
-    let instance = DbInstance::read_or_create(data.pool(), domain.to_string()).await?;
+    let instance = DbInstance::read_or_create(&mut context.pool(), domain.to_string()).await?;
+
+    let local_site = LocalSite::read(&mut context.pool()).await.ok();
+    let slur_regex = &local_site_opt_to_slur_regex(&local_site);
+    let sidebar = read_from_string_or_source_opt(&apub.content, &None, &apub.source);
+    let sidebar = process_markdown_opt(&sidebar, slur_regex, context).await?;
+    let icon = proxy_image_link_opt_apub(apub.icon.map(|i| i.url), context).await?;
+    let banner = proxy_image_link_opt_apub(apub.image.map(|i| i.url), context).await?;
 
     let site_form = SiteInsertForm {
       name: apub.name.clone(),
-      sidebar: read_from_string_or_source_opt(&apub.content, &None, &apub.source),
-      updated: apub.updated.map(|u| u.clone().naive_local()),
-      icon: apub.icon.clone().map(|i| i.url.into()),
-      banner: apub.image.clone().map(|i| i.url.into()),
-      description: apub.summary.clone(),
+      sidebar,
+      updated: apub.updated,
+      icon,
+      banner,
+      description: apub.summary,
       actor_id: Some(apub.id.clone().into()),
       last_refreshed_at: Some(naive_now()),
       inbox_url: Some(apub.inbox.clone().into()),
       public_key: Some(apub.public_key.public_key_pem.clone()),
       private_key: None,
       instance_id: instance.id,
+      content_warning: apub.content_warning,
     };
-    let languages = LanguageTag::to_language_id_multiple(apub.language, data.pool()).await?;
+    let languages =
+      LanguageTag::to_language_id_multiple(apub.language, &mut context.pool()).await?;
 
-    let site = Site::create(data.pool(), &site_form).await?;
-    SiteLanguage::update(data.pool(), languages, &site).await?;
+    let site = Site::create(&mut context.pool(), &site_form).await?;
+    SiteLanguage::update(&mut context.pool(), languages, &site).await?;
     Ok(site.into())
   }
 }
@@ -168,6 +183,11 @@ impl Actor for ApubSite {
     self.inbox_url.clone().into()
   }
 }
+impl GetActorType for ApubSite {
+  fn actor_type(&self) -> ActorType {
+    ActorType::Site
+  }
+}
 
 /// Try to fetch the instance actor (to make things like instance rules available).
 pub(in crate::objects) async fn fetch_instance_actor_for_object<T: Into<Url> + Clone>(
@@ -186,7 +206,7 @@ pub(in crate::objects) async fn fetch_instance_actor_for_object<T: Into<Url> + C
       debug!("Failed to dereference site for {}: {}", &instance_id, e);
       let domain = instance_id.domain().expect("has domain");
       Ok(
-        DbInstance::read_or_create(context.pool(), domain.to_string())
+        DbInstance::read_or_create(&mut context.pool(), domain.to_string())
           .await?
           .id,
       )
@@ -194,41 +214,36 @@ pub(in crate::objects) async fn fetch_instance_actor_for_object<T: Into<Url> + C
   }
 }
 
-pub(crate) async fn remote_instance_inboxes(pool: &DbPool) -> Result<Vec<Url>, LemmyError> {
-  Ok(
-    Site::read_remote_sites(pool)
-      .await?
-      .into_iter()
-      .map(|s| ApubSite::from(s).shared_inbox_or_inbox())
-      .collect(),
-  )
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
   use super::*;
-  use crate::{objects::tests::init_context, protocol::tests::file_to_json_object};
-  use lemmy_db_schema::traits::Crud;
+  use crate::protocol::tests::file_to_json_object;
+  use lemmy_utils::error::LemmyResult;
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
-  pub(crate) async fn parse_lemmy_instance(context: &Data<LemmyContext>) -> ApubSite {
-    let json: Instance = file_to_json_object("assets/lemmy/objects/instance.json").unwrap();
-    let id = Url::parse("https://enterprise.lemmy.ml/").unwrap();
-    ApubSite::verify(&json, &id, context).await.unwrap();
-    let site = ApubSite::from_json(json, context).await.unwrap();
+  pub(crate) async fn parse_lemmy_instance(context: &Data<LemmyContext>) -> LemmyResult<ApubSite> {
+    let json: Instance = file_to_json_object("assets/lemmy/objects/instance.json")?;
+    let id = Url::parse("https://enterprise.lemmy.ml/")?;
+    ApubSite::verify(&json, &id, context).await?;
+    let site = ApubSite::from_json(json, context).await?;
     assert_eq!(context.request_count(), 0);
-    site
+    Ok(site)
   }
 
   #[tokio::test]
   #[serial]
-  async fn test_parse_lemmy_instance() {
-    let context = init_context().await;
-    let site = parse_lemmy_instance(&context).await;
+  async fn test_parse_lemmy_instance() -> LemmyResult<()> {
+    let context = LemmyContext::init_test_context().await;
+    let site = parse_lemmy_instance(&context).await?;
 
     assert_eq!(site.name, "Enterprise");
-    assert_eq!(site.description.as_ref().unwrap().len(), 15);
+    assert_eq!(
+      site.description.as_ref().map(std::string::String::len),
+      Some(15)
+    );
 
-    Site::delete(context.pool(), site.id).await.unwrap();
+    Site::delete(&mut context.pool(), site.id).await?;
+    Ok(())
   }
 }
