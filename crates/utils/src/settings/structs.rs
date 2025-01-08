@@ -1,3 +1,4 @@
+use super::pictrs_placeholder_url;
 use doku::Document;
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
@@ -38,16 +39,13 @@ pub struct Settings {
   /// Whether the site is available over TLS. Needs to be true for federation to work.
   #[default(true)]
   pub tls_enabled: bool,
-  /// Set the URL for opentelemetry exports. If you do not have an opentelemetry collector, do not set this option
+  /// Set the URL for opentelemetry exports. If you do not have an opentelemetry collector, do not
+  /// set this option
   #[default(None)]
   #[doku(skip)]
   pub opentelemetry_url: Option<Url>,
-  /// The number of activitypub federation workers that can be in-flight concurrently
-  #[default(0)]
-  pub worker_count: usize,
-  /// The number of activitypub federation retry workers that can be in-flight concurrently
-  #[default(0)]
-  pub retry_count: usize,
+  #[default(Default::default())]
+  pub federation: FederationWorkerConfig,
   // Prometheus configuration.
   #[default(None)]
   #[doku(example = "Some(Default::default())")]
@@ -55,7 +53,7 @@ pub struct Settings {
   /// Sets a response Access-Control-Allow-Origin CORS header
   /// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
   #[default(None)]
-  #[doku(example = "*")]
+  #[doku(example = "lemmy.tld")]
   cors_origin: Option<String>,
 }
 
@@ -71,7 +69,7 @@ impl Settings {
 #[serde(default, deny_unknown_fields)]
 pub struct PictrsConfig {
   /// Address where pictrs is available (for image hosting)
-  #[default(Url::parse("http://localhost:8080").expect("parse pictrs url"))]
+  #[default(pictrs_placeholder_url())]
   #[doku(example = "http://localhost:8080")]
   pub url: Url,
 
@@ -85,19 +83,33 @@ pub struct PictrsConfig {
   /// To be removed in 0.20
   pub(super) cache_external_link_previews: Option<bool>,
 
-  /// Specifies how to handle remote images, so that users don't have to connect directly to remote servers.
+  /// Specifies how to handle remote images, so that users don't have to connect directly to remote
+  /// servers.
   #[default(PictrsImageMode::StoreLinkPreviews)]
   pub(super) image_mode: PictrsImageMode,
+
+  /// Allows bypassing proxy for specific image hosts when using ProxyAllImages.
+  ///
+  /// imgur.com is bypassed by default to avoid rate limit errors. When specifying any bypass
+  /// in the config, this default is ignored and you need to list imgur explicitly. To proxy imgur
+  /// requests, specify a noop bypass list, eg `proxy_bypass_domains ["example.org"]`.
+  #[default(vec!["i.imgur.com".to_string()])]
+  #[doku(example = "i.imgur.com")]
+  pub proxy_bypass_domains: Vec<String>,
 
   /// Timeout for uploading images to pictrs (in seconds)
   #[default(30)]
   pub upload_timeout: u64,
+
+  /// Resize post thumbnails to this maximum width/height.
+  #[default(512)]
+  pub max_thumbnail_size: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub enum PictrsImageMode {
-  /// Leave images unchanged, don't generate any local thumbnails for post urls. Instead the the
+  /// Leave images unchanged, don't generate any local thumbnails for post urls. Instead the
   /// Opengraph image is directly returned as thumbnail
   None,
   /// Generate thumbnails for external post urls and store them persistently in pict-rs. This
@@ -107,10 +119,11 @@ pub enum PictrsImageMode {
   /// This is the default behaviour, and also matches Lemmy 0.18.
   #[default]
   StoreLinkPreviews,
-  /// If enabled, all images from remote domains are rewritten to pass through `/api/v3/image_proxy`,
-  /// including embedded images in markdown. Images are stored temporarily in pict-rs for caching.
-  /// This improves privacy as users don't expose their IP to untrusted servers, and decreases load
-  /// on other servers. However it increases bandwidth use for the local server.
+  /// If enabled, all images from remote domains are rewritten to pass through
+  /// `/api/v4/image_proxy`, including embedded images in markdown. Images are stored temporarily
+  /// in pict-rs for caching. This improves privacy as users don't expose their IP to untrusted
+  /// servers, and decreases load on other servers. However it increases bandwidth use for the
+  /// local server.
   ///
   /// Requires pict-rs 0.5
   ProxyAllImages,
@@ -119,62 +132,22 @@ pub enum PictrsImageMode {
 #[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
 #[serde(default)]
 pub struct DatabaseConfig {
-  #[serde(flatten, default)]
-  pub(crate) connection: DatabaseConnection,
+  /// Configure the database by specifying URI pointing to a postgres instance
+  ///
+  /// This example uses peer authentication to obviate the need for creating,
+  /// configuring, and managing passwords.
+  ///
+  /// For an explanation of how to use connection URIs, see [here][0] in
+  /// PostgreSQL's documentation.
+  ///
+  /// [0]: https://www.postgresql.org/docs/current/libpq-connect.html#id-1.7.3.8.3.6
+  #[default("postgres://lemmy:password@localhost:5432/lemmy")]
+  #[doku(example = "postgresql:///lemmy?user=lemmy&host=/var/run/postgresql")]
+  pub(crate) connection: String,
 
   /// Maximum number of active sql connections
   #[default(30)]
   pub pool_size: usize,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
-#[serde(untagged)]
-pub enum DatabaseConnection {
-  /// Configure the database by specifying a URI
-  ///
-  /// This is the preferred method to specify database connection details since
-  /// it is the most flexible.
-  Uri {
-    /// Connection URI pointing to a postgres instance
-    ///
-    /// This example uses peer authentication to obviate the need for creating,
-    /// configuring, and managing passwords.
-    ///
-    /// For an explanation of how to use connection URIs, see [here][0] in
-    /// PostgreSQL's documentation.
-    ///
-    /// [0]: https://www.postgresql.org/docs/current/libpq-connect.html#id-1.7.3.8.3.6
-    #[doku(example = "postgresql:///lemmy?user=lemmy&host=/var/run/postgresql")]
-    uri: String,
-  },
-
-  /// Configure the database by specifying parts of a URI
-  ///
-  /// Note that specifying the `uri` field should be preferred since it provides
-  /// greater control over how the connection is made. This merely exists for
-  /// backwards-compatibility.
-  #[default]
-  Parts(DatabaseConnectionParts),
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
-#[serde(default)]
-pub struct DatabaseConnectionParts {
-  /// Username to connect to postgres
-  #[default("lemmy")]
-  pub(super) user: String,
-  /// Password to connect to postgres
-  #[default("password")]
-  pub(super) password: String,
-  #[default("localhost")]
-  /// Host where postgres is running
-  pub(super) host: String,
-  /// Port where postgres can be accessed
-  #[default(5432)]
-  pub(super) port: i32,
-  /// Name of the postgres database for lemmy
-  #[default("lemmy")]
-  pub(super) database: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Document, SmartDefault)]
@@ -233,4 +206,15 @@ pub struct PrometheusConfig {
   #[default(10002)]
   #[doku(example = "10002")]
   pub port: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, SmartDefault, Document)]
+#[serde(default)]
+// named federation"worker"config to disambiguate from the activitypub library configuration
+pub struct FederationWorkerConfig {
+  /// Limit to the number of concurrent outgoing federation requests per target instance.
+  /// Set this to a higher value than 1 (e.g. 6) only if you have a huge instance (>10 activities
+  /// per second) and if a receiving instance is not keeping up.
+  #[default(1)]
+  pub concurrent_sends_per_instance: i8,
 }

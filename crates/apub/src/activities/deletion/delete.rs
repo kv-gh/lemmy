@@ -14,7 +14,7 @@ use lemmy_db_schema::{
     comment::{Comment, CommentUpdateForm},
     comment_report::CommentReport,
     community::{Community, CommunityUpdateForm},
-    moderator::{
+    mod_log::moderator::{
       ModRemoveComment,
       ModRemoveCommentForm,
       ModRemoveCommunity,
@@ -27,7 +27,7 @@ use lemmy_db_schema::{
   },
   traits::{Crud, Reportable},
 };
-use lemmy_utils::error::{LemmyError, LemmyErrorType};
+use lemmy_utils::error::{FederationError, LemmyError, LemmyErrorType, LemmyResult};
 use url::Url;
 
 #[async_trait::async_trait]
@@ -44,13 +44,13 @@ impl ActivityHandler for Delete {
   }
 
   #[tracing::instrument(skip_all)]
-  async fn verify(&self, context: &Data<Self::DataType>) -> Result<(), LemmyError> {
+  async fn verify(&self, context: &Data<Self::DataType>) -> LemmyResult<()> {
     verify_delete_activity(self, self.summary.is_some(), context).await?;
     Ok(())
   }
 
   #[tracing::instrument(skip_all)]
-  async fn receive(self, context: &Data<LemmyContext>) -> Result<(), LemmyError> {
+  async fn receive(self, context: &Data<LemmyContext>) -> LemmyResult<()> {
     insert_received_activity(&self.id, context).await?;
     if let Some(reason) = self.summary {
       // We set reason to empty string if it doesn't exist, to distinguish between delete and
@@ -84,11 +84,11 @@ impl Delete {
   pub(in crate::activities::deletion) fn new(
     actor: &ApubPerson,
     object: DeletableObjects,
-    to: Url,
+    to: Vec<Url>,
     community: Option<&Community>,
     summary: Option<String>,
     context: &Data<LemmyContext>,
-  ) -> Result<Delete, LemmyError> {
+  ) -> LemmyResult<Delete> {
     let id = generate_activity_id(
       DeleteType::Delete,
       &context.settings().get_protocol_and_hostname(),
@@ -96,7 +96,7 @@ impl Delete {
     let cc: Option<Url> = community.map(|c| c.actor_id.clone().into());
     Ok(Delete {
       actor: actor.actor_id.clone().into(),
-      to: vec![to],
+      to,
       object: IdOrNestedObject::Id(object.id()),
       cc: cc.into_iter().collect(),
       kind: DeleteType::Delete,
@@ -114,11 +114,11 @@ pub(in crate::activities) async fn receive_remove_action(
   object: &Url,
   reason: Option<String>,
   context: &Data<LemmyContext>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   match DeletableObjects::read_from_db(object, context).await? {
     DeletableObjects::Community(community) => {
       if community.local {
-        Err(LemmyErrorType::OnlyLocalAdminCanRemoveCommunity)?
+        Err(FederationError::OnlyLocalAdminCanRemoveCommunity)?
       }
       let form = ModRemoveCommunityForm {
         mod_person_id: actor.id,
@@ -175,8 +175,9 @@ pub(in crate::activities) async fn receive_remove_action(
       )
       .await?;
     }
-    DeletableObjects::PrivateMessage(_) => unimplemented!(),
-    DeletableObjects::Person { .. } => unimplemented!(),
+    // TODO these need to be implemented yet, for now, return errors
+    DeletableObjects::PrivateMessage(_) => Err(LemmyErrorType::NotFound)?,
+    DeletableObjects::Person(_) => Err(LemmyErrorType::NotFound)?,
   }
   Ok(())
 }

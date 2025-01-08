@@ -88,32 +88,26 @@ pub struct PersonMentionId(i32);
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "full", derive(DieselNewType, TS))]
 #[cfg_attr(feature = "full", ts(export))]
-/// The person block id.
-pub struct PersonBlockId(i32);
-
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "full", derive(DieselNewType, TS))]
-#[cfg_attr(feature = "full", ts(export))]
 /// The comment report id.
-pub struct CommentReportId(i32);
+pub struct CommentReportId(pub i32);
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "full", derive(DieselNewType, TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// The post report id.
-pub struct PostReportId(i32);
+pub struct PostReportId(pub i32);
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "full", derive(DieselNewType, TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// The private message report id.
-pub struct PrivateMessageReportId(i32);
+pub struct PrivateMessageReportId(pub i32);
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "full", derive(DieselNewType, TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// The site id.
-pub struct SiteId(i32);
+pub struct SiteId(pub i32);
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "full", derive(DieselNewType, TS))]
@@ -127,11 +121,13 @@ pub struct LanguageId(pub i32);
 /// The comment reply id.
 pub struct CommentReplyId(i32);
 
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(
+  Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default, Ord, PartialOrd,
+)]
 #[cfg_attr(feature = "full", derive(DieselNewType, TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// The instance id.
-pub struct InstanceId(i32);
+pub struct InstanceId(pub i32);
 
 #[derive(
   Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default, PartialOrd, Ord,
@@ -152,6 +148,24 @@ pub struct LocalSiteId(i32);
 /// The custom emoji id.
 pub struct CustomEmojiId(i32);
 
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "full", derive(DieselNewType, TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// The tagline id.
+pub struct TaglineId(i32);
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "full", derive(DieselNewType, TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// The registration application id.
+pub struct RegistrationApplicationId(i32);
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "full", derive(DieselNewType, TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// The oauth provider id.
+pub struct OAuthProviderId(pub i32);
+
 #[cfg(feature = "full")]
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Ltree")]
@@ -160,9 +174,25 @@ pub struct LtreeDef(pub String);
 
 #[repr(transparent)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Hash)]
-#[cfg_attr(feature = "full", derive(AsExpression, FromSqlRow))]
+#[cfg_attr(feature = "full", derive(AsExpression, FromSqlRow, TS))]
 #[cfg_attr(feature = "full", diesel(sql_type = diesel::sql_types::Text))]
+#[cfg_attr(feature = "full", ts(export))]
 pub struct DbUrl(pub(crate) Box<Url>);
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Default)]
+#[cfg_attr(feature = "full", derive(DieselNewType))]
+/// The report combined id
+pub struct ReportCombinedId(i32);
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Default)]
+#[cfg_attr(feature = "full", derive(DieselNewType))]
+/// The person content combined id
+pub struct PersonContentCombinedId(i32);
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Default)]
+#[cfg_attr(feature = "full", derive(DieselNewType))]
+/// The person saved combined id
+pub struct PersonSavedCombinedId(i32);
 
 impl DbUrl {
   pub fn inner(&self) -> &Url {
@@ -176,14 +206,14 @@ impl Display for DbUrl {
   }
 }
 
-// the project doesnt compile with From
-#[allow(clippy::from_over_into)]
+// the project doesn't compile with From
+#[expect(clippy::from_over_into)]
 impl Into<DbUrl> for Url {
   fn into(self) -> DbUrl {
     DbUrl(Box::new(self))
   }
 }
-#[allow(clippy::from_over_into)]
+#[expect(clippy::from_over_into)]
 impl Into<Url> for DbUrl {
   fn into(self) -> Url {
     *self.0
@@ -235,19 +265,6 @@ impl Deref for DbUrl {
 }
 
 #[cfg(feature = "full")]
-impl TS for DbUrl {
-  fn name() -> String {
-    "string".to_string()
-  }
-  fn dependencies() -> Vec<ts_rs::Dependency> {
-    Vec::new()
-  }
-  fn transparent() -> bool {
-    true
-  }
-}
-
-#[cfg(feature = "full")]
 impl ToSql<Text, Pg> for DbUrl {
   fn to_sql(&self, out: &mut Output<Pg>) -> diesel::serialize::Result {
     <std::string::String as ToSql<Text, Pg>>::to_sql(&self.0.to_string(), &mut out.reborrow())
@@ -281,3 +298,9 @@ impl InstanceId {
     self.0
   }
 }
+
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "full", derive(DieselNewType, TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// The internal tag id.
+pub struct TagId(pub i32);

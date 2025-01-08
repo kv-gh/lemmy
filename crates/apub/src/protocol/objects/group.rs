@@ -7,7 +7,7 @@ use crate::{
     community_outbox::ApubCommunityOutbox,
   },
   local_site_data_cached,
-  objects::{community::ApubCommunity, read_from_string_or_source_opt},
+  objects::community::ApubCommunity,
   protocol::{
     objects::{Endpoints, LanguageTag},
     ImageObject,
@@ -15,18 +15,20 @@ use crate::{
   },
 };
 use activitypub_federation::{
+  config::Data,
   fetch::{collection_id::CollectionId, object_id::ObjectId},
   kinds::actor::GroupType,
   protocol::{
     helpers::deserialize_skip_error,
     public_key::PublicKey,
+    values::MediaTypeHtml,
     verification::verify_domains_match,
   },
 };
 use chrono::{DateTime, Utc};
 use lemmy_api_common::{context::LemmyContext, utils::local_site_opt_to_slur_regex};
 use lemmy_utils::{
-  error::LemmyError,
+  error::LemmyResult,
   utils::slurs::{check_slurs, check_slurs_opt},
 };
 use serde::{Deserialize, Serialize};
@@ -44,14 +46,18 @@ pub struct Group {
   /// username, set at account creation and usually fixed after that
   pub(crate) preferred_username: String,
   pub(crate) inbox: Url,
-  pub(crate) followers: CollectionId<ApubCommunityFollower>,
+  pub(crate) followers: Option<CollectionId<ApubCommunityFollower>>,
   pub(crate) public_key: PublicKey,
 
   /// title
   pub(crate) name: Option<String>,
-  pub(crate) summary: Option<String>,
+  // sidebar
+  pub(crate) content: Option<String>,
   #[serde(deserialize_with = "deserialize_skip_error", default)]
   pub(crate) source: Option<Source>,
+  pub(crate) media_type: Option<MediaTypeHtml>,
+  // short instance description
+  pub(crate) summary: Option<String>,
   #[serde(deserialize_with = "deserialize_skip_error", default)]
   pub(crate) icon: Option<ImageObject>,
   /// banner
@@ -67,6 +73,8 @@ pub struct Group {
   pub(crate) featured: Option<CollectionId<ApubCommunityFeatured>>,
   #[serde(default)]
   pub(crate) language: Vec<LanguageTag>,
+  /// True if this is a private community
+  pub(crate) manually_approves_followers: Option<bool>,
   pub(crate) published: Option<DateTime<Utc>>,
   pub(crate) updated: Option<DateTime<Utc>>,
 }
@@ -75,8 +83,8 @@ impl Group {
   pub(crate) async fn verify(
     &self,
     expected_domain: &Url,
-    context: &LemmyContext,
-  ) -> Result<(), LemmyError> {
+    context: &Data<LemmyContext>,
+  ) -> LemmyResult<()> {
     check_apub_id_valid_with_strictness(self.id.inner(), true, context).await?;
     verify_domains_match(expected_domain, self.id.inner())?;
 
@@ -85,8 +93,7 @@ impl Group {
 
     check_slurs(&self.preferred_username, slur_regex)?;
     check_slurs_opt(&self.name, slur_regex)?;
-    let description = read_from_string_or_source_opt(&self.summary, &None, &self.source);
-    check_slurs_opt(&description, slur_regex)?;
+    check_slurs_opt(&self.summary, slur_regex)?;
     Ok(())
   }
 }

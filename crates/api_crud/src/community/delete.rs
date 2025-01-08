@@ -13,22 +13,22 @@ use lemmy_db_schema::{
 };
 use lemmy_db_views::structs::LocalUserView;
 use lemmy_db_views_actor::structs::CommunityModeratorView;
-use lemmy_utils::error::{LemmyError, LemmyErrorExt, LemmyErrorType};
+use lemmy_utils::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
 
 #[tracing::instrument(skip(context))]
 pub async fn delete_community(
   data: Json<DeleteCommunity>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<CommunityResponse>, LemmyError> {
+) -> LemmyResult<Json<CommunityResponse>> {
   // Fetch the community mods
-  let community_id = data.community_id;
   let community_mods =
-    CommunityModeratorView::for_community(&mut context.pool(), community_id).await?;
+    CommunityModeratorView::for_community(&mut context.pool(), data.community_id).await?;
 
+  let community = Community::read(&mut context.pool(), data.community_id).await?;
   check_community_mod_action(
     &local_user_view.person,
-    community_id,
+    &community,
     true,
     &mut context.pool(),
   )
@@ -54,8 +54,7 @@ pub async fn delete_community(
   ActivityChannel::submit_activity(
     SendActivityData::DeleteCommunity(local_user_view.person.clone(), community, data.deleted),
     &context,
-  )
-  .await?;
+  )?;
 
   build_community_response(&context, local_user_view, community_id).await
 }

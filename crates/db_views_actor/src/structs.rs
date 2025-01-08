@@ -6,11 +6,9 @@ use lemmy_db_schema::{
     comment::Comment,
     comment_reply::CommentReply,
     community::Community,
-    instance::Instance,
     person::Person,
     person_mention::PersonMention,
     post::Post,
-    site::Site,
   },
   SubscribedType,
 };
@@ -18,28 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 #[cfg(feature = "full")]
 use ts_rs::TS;
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "full", derive(TS, Queryable))]
-#[cfg_attr(feature = "full", diesel(check_for_backend(diesel::pg::Pg)))]
-#[cfg_attr(feature = "full", ts(export))]
-/// A community block.
-pub struct CommunityBlockView {
-  pub person: Person,
-  pub community: Community,
-}
-
-#[skip_serializing_none]
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "full", derive(TS, Queryable))]
-#[cfg_attr(feature = "full", diesel(check_for_backend(diesel::pg::Pg)))]
-#[cfg_attr(feature = "full", ts(export))]
-/// An instance block by a user.
-pub struct InstanceBlockView {
-  pub person: Person,
-  pub instance: Instance,
-  pub site: Option<Site>,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "full", derive(TS, Queryable))]
@@ -83,14 +59,33 @@ pub struct CommunityView {
   pub banned_from_community: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "full", derive(TS, Queryable))]
-#[cfg_attr(feature = "full", diesel(check_for_backend(diesel::pg::Pg)))]
+/// The community sort types. See here for descriptions: https://join-lemmy.org/docs/en/users/03-votes-and-ranking.html
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
-/// A person block.
-pub struct PersonBlockView {
-  pub person: Person,
-  pub target: Person,
+pub enum CommunitySortType {
+  #[default]
+  Active,
+  Hot,
+  New,
+  Old,
+  TopDay,
+  TopWeek,
+  TopMonth,
+  TopYear,
+  TopAll,
+  MostComments,
+  NewComments,
+  TopHour,
+  TopSixHour,
+  TopTwelveHour,
+  TopThreeMonths,
+  TopSixMonths,
+  TopNineMonths,
+  Controversial,
+  Scaled,
+  NameAsc,
+  NameDesc,
 }
 
 #[skip_serializing_none]
@@ -108,11 +103,13 @@ pub struct PersonMentionView {
   pub recipient: Person,
   pub counts: CommentAggregates,
   pub creator_banned_from_community: bool,
+  pub banned_from_community: bool,
   pub creator_is_moderator: bool,
   pub creator_is_admin: bool,
   pub subscribed: SubscribedType,
   pub saved: bool,
   pub creator_blocked: bool,
+  #[cfg_attr(feature = "full", ts(optional))]
   pub my_vote: Option<i16>,
 }
 
@@ -131,11 +128,13 @@ pub struct CommentReplyView {
   pub recipient: Person,
   pub counts: CommentAggregates,
   pub creator_banned_from_community: bool,
+  pub banned_from_community: bool,
   pub creator_is_moderator: bool,
   pub creator_is_admin: bool,
   pub subscribed: SubscribedType,
   pub saved: bool,
   pub creator_blocked: bool,
+  #[cfg_attr(feature = "full", ts(optional))]
   pub my_vote: Option<i16>,
 }
 
@@ -148,4 +147,15 @@ pub struct PersonView {
   pub person: Person,
   pub counts: PersonAggregates,
   pub is_admin: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "full", derive(TS, Queryable))]
+#[cfg_attr(feature = "full", diesel(check_for_backend(diesel::pg::Pg)))]
+#[cfg_attr(feature = "full", ts(export))]
+pub struct PendingFollow {
+  pub person: Person,
+  pub community: Community,
+  pub is_new_instance: bool,
+  pub subscribed: SubscribedType,
 }

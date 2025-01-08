@@ -3,26 +3,26 @@ use crate::{
   insert_received_activity,
   objects::{person::ApubPerson, private_message::ApubPrivateMessage},
   protocol::activities::{
-    create_or_update::chat_message::CreateOrUpdateChatMessage,
+    create_or_update::private_message::CreateOrUpdatePrivateMessage,
     CreateOrUpdateType,
   },
 };
 use activitypub_federation::{
   config::Data,
-  protocol::verification::verify_domains_match,
+  protocol::verification::{verify_domains_match, verify_urls_match},
   traits::{ActivityHandler, Actor, Object},
 };
 use lemmy_api_common::context::LemmyContext;
 use lemmy_db_schema::source::activity::ActivitySendTargets;
 use lemmy_db_views::structs::PrivateMessageView;
-use lemmy_utils::error::LemmyError;
+use lemmy_utils::error::{LemmyError, LemmyResult};
 use url::Url;
 
 pub(crate) async fn send_create_or_update_pm(
   pm_view: PrivateMessageView,
   kind: CreateOrUpdateType,
   context: Data<LemmyContext>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let actor: ApubPerson = pm_view.creator.into();
   let recipient: ApubPerson = pm_view.recipient.into();
 
@@ -30,7 +30,7 @@ pub(crate) async fn send_create_or_update_pm(
     kind.clone(),
     &context.settings().get_protocol_and_hostname(),
   )?;
-  let create_or_update = CreateOrUpdateChatMessage {
+  let create_or_update = CreateOrUpdatePrivateMessage {
     id: id.clone(),
     actor: actor.id().into(),
     to: [recipient.id().into()],
@@ -44,7 +44,7 @@ pub(crate) async fn send_create_or_update_pm(
 }
 
 #[async_trait::async_trait]
-impl ActivityHandler for CreateOrUpdateChatMessage {
+impl ActivityHandler for CreateOrUpdatePrivateMessage {
   type DataType = LemmyContext;
   type Error = LemmyError;
 
@@ -57,16 +57,17 @@ impl ActivityHandler for CreateOrUpdateChatMessage {
   }
 
   #[tracing::instrument(skip_all)]
-  async fn verify(&self, context: &Data<Self::DataType>) -> Result<(), LemmyError> {
+  async fn verify(&self, context: &Data<Self::DataType>) -> LemmyResult<()> {
     verify_person(&self.actor, context).await?;
     verify_domains_match(self.actor.inner(), self.object.id.inner())?;
     verify_domains_match(self.to[0].inner(), self.object.to[0].inner())?;
+    verify_urls_match(self.actor.inner(), self.object.attributed_to.inner())?;
     ApubPrivateMessage::verify(&self.object, self.actor.inner(), context).await?;
     Ok(())
   }
 
   #[tracing::instrument(skip_all)]
-  async fn receive(self, context: &Data<Self::DataType>) -> Result<(), LemmyError> {
+  async fn receive(self, context: &Data<Self::DataType>) -> LemmyResult<()> {
     insert_received_activity(&self.id, context).await?;
     ApubPrivateMessage::from_json(self.object, context).await?;
     Ok(())

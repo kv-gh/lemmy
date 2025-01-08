@@ -22,7 +22,6 @@ import {
   createCommunity,
   registerUser,
   reportComment,
-  listCommentReports,
   randomString,
   unfollows,
   getComments,
@@ -37,15 +36,22 @@ import {
   followCommunity,
   blockCommunity,
   delay,
+  saveUserSettings,
+  listReports,
 } from "./shared";
-import { CommentView, CommunityView } from "lemmy-js-client";
+import {
+  CommentReportView,
+  CommentView,
+  CommunityView,
+  ReportCombinedView,
+  SaveUserSettings,
+} from "lemmy-js-client";
 
 let betaCommunity: CommunityView | undefined;
 let postOnAlphaRes: PostResponse;
 
 beforeAll(async () => {
   await setupLogins();
-  await unfollows();
   await Promise.all([followBeta(alpha), followBeta(gamma)]);
   betaCommunity = (await resolveBetaCommunity(alpha)).community;
   if (betaCommunity) {
@@ -53,9 +59,7 @@ beforeAll(async () => {
   }
 });
 
-afterAll(() => {
-  unfollows();
-});
+afterAll(unfollows);
 
 function assertCommentFederation(
   commentOne?: CommentView,
@@ -94,7 +98,7 @@ test("Create a comment", async () => {
 
 test("Create a comment in a non-existent post", async () => {
   await expect(createComment(alpha, -1)).rejects.toStrictEqual(
-    Error("couldnt_find_post"),
+    Error("not_found"),
   );
 });
 
@@ -145,7 +149,7 @@ test("Delete a comment", async () => {
     await waitUntil(
       () =>
         resolveComment(gamma, commentRes.comment_view.comment).catch(e => e),
-      r => r.message !== "couldnt_find_object",
+      r => r.message !== "not_found",
     )
   ).comment;
   if (!gammaComment) {
@@ -158,18 +162,17 @@ test("Delete a comment", async () => {
     commentRes.comment_view.comment.id,
   );
   expect(deleteCommentRes.comment_view.comment.deleted).toBe(true);
-  expect(deleteCommentRes.comment_view.comment.content).toBe("");
 
-  // Make sure that comment is undefined on beta
+  // Make sure that comment is deleted on beta
   await waitUntil(
-    () => resolveComment(beta, commentRes.comment_view.comment).catch(e => e),
-    e => e.message == "couldnt_find_object",
+    () => resolveComment(beta, commentRes.comment_view.comment),
+    c => c.comment?.comment.deleted === true,
   );
 
-  // Make sure that comment is undefined on gamma after delete
+  // Make sure that comment is deleted on gamma after delete
   await waitUntil(
-    () => resolveComment(gamma, commentRes.comment_view.comment).catch(e => e),
-    e => e.message === "couldnt_find_object",
+    () => resolveComment(gamma, commentRes.comment_view.comment),
+    c => c.comment?.comment.deleted === true,
   );
 
   // Test undeleting the comment
@@ -183,11 +186,10 @@ test("Delete a comment", async () => {
   // Make sure that comment is undeleted on beta
   let betaComment2 = (
     await waitUntil(
-      () => resolveComment(beta, commentRes.comment_view.comment).catch(e => e),
-      e => e.message !== "couldnt_find_object",
+      () => resolveComment(beta, commentRes.comment_view.comment),
+      c => c.comment?.comment.deleted === false,
     )
   ).comment;
-  expect(betaComment2?.comment.deleted).toBe(false);
   assertCommentFederation(betaComment2, undeleteCommentRes.comment_view);
 });
 
@@ -257,7 +259,6 @@ test("Remove a comment from admin and community on different instance", async ()
     betaComment.comment.id,
   );
   expect(removeCommentRes.comment_view.comment.removed).toBe(true);
-  expect(removeCommentRes.comment_view.comment.content).toBe("");
 
   // Comment text is also hidden from list
   let listComments = await getComments(
@@ -266,7 +267,6 @@ test("Remove a comment from admin and community on different instance", async ()
   );
   expect(listComments.comments.length).toBe(1);
   expect(listComments.comments[0].comment.removed).toBe(true);
-  expect(listComments.comments[0].comment.content).toBe("");
 
   // Make sure its not removed on alpha
   let refetchedPostComments = await getComments(
@@ -444,6 +444,59 @@ test("Reply to a comment from another instance, get notification", async () => {
   // this is a new notification, getReplies fetch was for read/unread both, confirm it is unread.
   expect(alphaReply.comment_reply.read).toBe(false);
   assertCommentFederation(alphaReply, replyRes.comment_view);
+});
+
+test("Bot reply notifications are filtered when bots are hidden", async () => {
+  const newAlphaBot = await registerUser(alpha, alphaUrl);
+  let form: SaveUserSettings = {
+    bot_account: true,
+  };
+  await saveUserSettings(newAlphaBot, form);
+
+  const alphaCommunity = (
+    await resolveCommunity(alpha, "!main@lemmy-alpha:8541")
+  ).community;
+
+  if (!alphaCommunity) {
+    throw "Missing alpha community";
+  }
+
+  await alpha.markAllAsRead();
+  form = {
+    show_bot_accounts: false,
+  };
+  await saveUserSettings(alpha, form);
+  const postOnAlphaRes = await createPost(alpha, alphaCommunity.community.id);
+
+  // Bot reply to alpha's post
+  let commentRes = await createComment(
+    newAlphaBot,
+    postOnAlphaRes.post_view.post.id,
+  );
+  expect(commentRes).toBeDefined();
+
+  let alphaUnreadCountRes = await getUnreadCount(alpha);
+  expect(alphaUnreadCountRes.replies).toBe(0);
+
+  let alphaUnreadRepliesRes = await getReplies(alpha, true);
+  expect(alphaUnreadRepliesRes.replies.length).toBe(0);
+
+  // This both restores the original state that may be expected by other tests
+  // implicitly and is used by the next steps to ensure replies are still
+  // returned when a user later decides to show bot accounts again.
+  form = {
+    show_bot_accounts: true,
+  };
+  await saveUserSettings(alpha, form);
+
+  alphaUnreadCountRes = await getUnreadCount(alpha);
+  expect(alphaUnreadCountRes.replies).toBe(1);
+
+  alphaUnreadRepliesRes = await getReplies(alpha, true);
+  expect(alphaUnreadRepliesRes.replies.length).toBe(1);
+  expect(alphaUnreadRepliesRes.replies[0].comment.id).toBe(
+    commentRes.comment_view.comment.id,
+  );
 });
 
 test("Mention beta from alpha", async () => {
@@ -652,10 +705,10 @@ test("Check that activity from another instance is sent to third instance", asyn
 
 test("Fetch in_reply_tos: A is unsubbed from B, B makes a post, and some embedded comments, A subs to B, B updates the lowest level comment, A fetches both the post and all the inreplyto comments for that post.", async () => {
   // Unfollow all remote communities
-  let site = await unfollowRemotes(alpha);
-  expect(
-    site.my_user?.follows.filter(c => c.community.local == false).length,
-  ).toBe(0);
+  let my_user = await unfollowRemotes(alpha);
+  expect(my_user.follows.filter(c => c.community.local == false).length).toBe(
+    0,
+  );
 
   // B creates a post, and two comments, should be invisible to A
   let postOnBetaRes = await createPost(beta, 2);
@@ -749,13 +802,17 @@ test("Report a comment", async () => {
   let alphaReport = (await reportComment(alpha, alphaComment.id, reason))
     .comment_report_view.comment_report;
 
-  let betaReport = (await waitUntil(
-    () =>
-      listCommentReports(beta).then(r =>
-        r.comment_reports.find(rep => rep.comment_report.reason === reason),
-      ),
-    e => !!e,
-  ))!.comment_report;
+  let betaReport = (
+    (await waitUntil(
+      () =>
+        listReports(beta).then(p =>
+          p.reports.find(r => {
+            return checkCommentReportReason(r, reason);
+          }),
+        ),
+      e => !!e,
+    )!) as CommentReportView
+  ).comment_report;
   expect(betaReport).toBeDefined();
   expect(betaReport.resolved).toBe(false);
   expect(betaReport.original_comment_text).toBe(
@@ -807,3 +864,35 @@ test("Dont send a comment reply to a blocked community", async () => {
   blockRes = await blockCommunity(beta, newCommunityId, false);
   expect(blockRes.blocked).toBe(false);
 });
+
+/// Fetching a deeply nested comment can lead to stack overflow as all parent comments are also
+/// fetched recursively. Ensure that it works properly.
+test.skip("Fetch a deeply nested comment", async () => {
+  let lastComment;
+  for (let i = 0; i < 50; i++) {
+    let commentRes = await createComment(
+      alpha,
+      postOnAlphaRes.post_view.post.id,
+      lastComment?.comment_view.comment.id,
+    );
+    expect(commentRes.comment_view.comment).toBeDefined();
+    lastComment = commentRes;
+  }
+
+  let betaComment = await resolveComment(
+    beta,
+    lastComment!.comment_view.comment,
+  );
+
+  expect(betaComment!.comment!.comment).toBeDefined();
+  expect(betaComment?.comment?.post).toBeDefined();
+});
+
+function checkCommentReportReason(rcv: ReportCombinedView, reason: string) {
+  switch (rcv.type_) {
+    case "Comment":
+      return rcv.comment_report.reason === reason;
+    default:
+      return false;
+  }
+}

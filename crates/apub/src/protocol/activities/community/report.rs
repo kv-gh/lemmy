@@ -11,7 +11,7 @@ use activitypub_federation::{
   protocol::helpers::deserialize_one,
 };
 use lemmy_api_common::context::LemmyContext;
-use lemmy_utils::error::{LemmyError, LemmyErrorType, LemmyResult};
+use lemmy_utils::error::{LemmyErrorType, LemmyResult};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -38,7 +38,7 @@ impl Report {
       .summary
       .clone()
       .or(self.content.clone())
-      .ok_or(LemmyErrorType::CouldntFindObject.into())
+      .ok_or(LemmyErrorType::NotFound.into())
   }
 }
 
@@ -63,7 +63,7 @@ impl ReportObject {
             return deref;
           }
         }
-        Err(LemmyErrorType::CouldntFindObject.into())
+        Err(LemmyErrorType::NotFound.into())
       }
     }
   }
@@ -71,7 +71,7 @@ impl ReportObject {
 
 #[async_trait::async_trait]
 impl InCommunity for Report {
-  async fn community(&self, context: &Data<LemmyContext>) -> Result<ApubCommunity, LemmyError> {
+  async fn community(&self, context: &Data<LemmyContext>) -> LemmyResult<ApubCommunity> {
     let community = self.to[0].dereference(context).await?;
     if let Some(audience) = &self.audience {
       verify_community_matches(audience, community.actor_id.clone())?;

@@ -5,12 +5,13 @@ use lemmy_api_common::{
   context::LemmyContext,
   person::{BanPerson, BanPersonResponse},
   send_activity::{ActivityChannel, SendActivityData},
-  utils::{check_expire_time, is_admin, remove_user_data},
+  utils::{check_expire_time, is_admin, remove_or_restore_user_data},
 };
 use lemmy_db_schema::{
   source::{
+    local_user::LocalUser,
     login_token::LoginToken,
-    moderator::{ModBan, ModBanForm},
+    mod_log::moderator::{ModBan, ModBanForm},
     person::{Person, PersonUpdateForm},
   },
   traits::Crud,
@@ -18,7 +19,7 @@ use lemmy_db_schema::{
 use lemmy_db_views::structs::LocalUserView;
 use lemmy_db_views_actor::structs::PersonView;
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorExt, LemmyErrorType},
+  error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   utils::validation::is_valid_body_field,
 };
 
@@ -27,11 +28,21 @@ pub async fn ban_from_site(
   data: Json<BanPerson>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<BanPersonResponse>, LemmyError> {
+) -> LemmyResult<Json<BanPersonResponse>> {
   // Make sure user is an admin
   is_admin(&local_user_view)?;
 
-  is_valid_body_field(&data.reason, false)?;
+  // Also make sure you're a higher admin than the target
+  LocalUser::is_higher_admin_check(
+    &mut context.pool(),
+    local_user_view.person.id,
+    vec![data.person_id],
+  )
+  .await?;
+
+  if let Some(reason) = &data.reason {
+    is_valid_body_field(reason, false)?;
+  }
 
   let expires = check_expire_time(data.expires)?;
 
@@ -54,10 +65,17 @@ pub async fn ban_from_site(
   }
 
   // Remove their data if that's desired
-  let remove_data = data.remove_data.unwrap_or(false);
-  if remove_data {
-    remove_user_data(person.id, &context).await?;
-  }
+  if data.remove_or_restore_data.unwrap_or(false) {
+    let removed = data.ban;
+    remove_or_restore_user_data(
+      local_user_view.person.id,
+      person.id,
+      removed,
+      &data.reason,
+      &context,
+    )
+    .await?;
+  };
 
   // Mod tables
   let form = ModBanForm {
@@ -70,14 +88,14 @@ pub async fn ban_from_site(
 
   ModBan::create(&mut context.pool(), &form).await?;
 
-  let person_view = PersonView::read(&mut context.pool(), person.id).await?;
+  let person_view = PersonView::read(&mut context.pool(), person.id, false).await?;
 
   ban_nonlocal_user_from_local_communities(
     &local_user_view,
     &person,
     data.ban,
     &data.reason,
-    &data.remove_data,
+    &data.remove_or_restore_data,
     &data.expires,
     &context,
   )
@@ -88,13 +106,12 @@ pub async fn ban_from_site(
       moderator: local_user_view.person,
       banned_user: person_view.person.clone(),
       reason: data.reason.clone(),
-      remove_data: data.remove_data,
+      remove_or_restore_data: data.remove_or_restore_data,
       ban: data.ban,
       expires: data.expires,
     },
     &context,
-  )
-  .await?;
+  )?;
 
   Ok(Json(BanPersonResponse {
     person_view,
